@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"derive":[["Decodable",""],["Encodable",""],["UnzipConsensus",""]],"struct":[["DecodeError",""]],"trait":[["Decodable","Data which can be encoded in a consensus-consistent way"],["DynEncodable","Object-safe trait for things that can encode themselves"],["Encodable","Data which can be encoded in a consensus-consistent way"]]};

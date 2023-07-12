@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":[["DatabaseOperation",""]],"struct":[["DatabaseDeleteOperation",""],["DatabaseInsertOperation",""],["DummyError",""],["MemDatabase",""],["MemTransaction",""]]};

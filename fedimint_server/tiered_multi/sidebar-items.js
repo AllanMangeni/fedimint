@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":[["TieredMulti","Represents notes of different denominations."],["TieredMultiZip",""],["TieredSummary",""]]};

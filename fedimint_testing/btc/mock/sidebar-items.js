@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":[["inputs",""],["output_sum",""]],"struct":[["FakeBitcoinFactory",""],["FakeBitcoinTest",""]]};
