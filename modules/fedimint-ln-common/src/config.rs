@@ -1,15 +1,14 @@
-use std::str::FromStr;
-
-use bitcoin::Network;
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
+pub use bitcoin::Network;
 use fedimint_core::core::ModuleKind;
+use fedimint_core::encoding::btc::NetworkLegacyEncodingWrapper;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::plugin_types_trait_impl_config;
-use lightning::routing::gossip::RoutingFees;
+use fedimint_core::envs::BitcoinRpcConfig;
+use fedimint_core::{Amount, msats, plugin_types_trait_impl_config};
+use lightning_invoice::RoutingFees;
 use serde::{Deserialize, Serialize};
 use threshold_crypto::serde_impl::SerdeSecret;
 
-use crate::LightningCommonGen;
+use crate::LightningCommonInit;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightningGenParams {
@@ -57,7 +56,7 @@ pub struct LightningConfigConsensus {
     pub threshold_pub_keys: threshold_crypto::PublicKeySet,
     /// Fees charged for LN transactions
     pub fee_consensus: FeeConsensus,
-    pub network: Network,
+    pub network: NetworkLegacyEncodingWrapper,
 }
 
 impl LightningConfigConsensus {
@@ -78,12 +77,22 @@ pub struct LightningConfigPrivate {
 pub struct LightningClientConfig {
     pub threshold_pub_key: threshold_crypto::PublicKey,
     pub fee_consensus: FeeConsensus,
-    pub network: Network,
+    pub network: NetworkLegacyEncodingWrapper,
+}
+
+impl std::fmt::Display for LightningClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LightningClientConfig {}",
+            serde_json::to_string(self).map_err(|_e| std::fmt::Error)?
+        )
+    }
 }
 
 // Wire together the configs for this module
 plugin_types_trait_impl_config!(
-    LightningCommonGen,
+    LightningCommonInit,
     LightningGenParams,
     LightningGenParamsLocal,
     LightningGenParamsConsensus,
@@ -109,30 +118,23 @@ impl Default for FeeConsensus {
     }
 }
 
-/// Gateway routing fees
-#[derive(Debug, Clone)]
-pub struct GatewayFee(pub RoutingFees);
+/// Trait for converting a fee type to specific `Amount`,
+/// relative to a given payment `Amount`
+pub trait FeeToAmount {
+    /// Calculates fee `Amount` given a payment `Amount`
+    fn to_amount(&self, payment: &Amount) -> Amount;
+}
 
-impl FromStr for GatewayFee {
-    type Err = anyhow::Error;
+impl FeeToAmount for RoutingFees {
+    fn to_amount(&self, payment: &Amount) -> Amount {
+        let base_fee = u64::from(self.base_msat);
+        let margin_fee: u64 = if self.proportional_millionths > 0 {
+            let fee_percent = 1_000_000 / u64::from(self.proportional_millionths);
+            payment.msats / fee_percent
+        } else {
+            0
+        };
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut parts = s.split(',');
-        let base_msat = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing base fee in millisatoshis"))?
-            .parse()?;
-        let proportional_millionths = parts
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing liquidity based fee as proportional millionths of routed amount"
-                )
-            })?
-            .parse()?;
-        Ok(GatewayFee(RoutingFees {
-            base_msat,
-            proportional_millionths,
-        }))
+        msats(base_fee + margin_fee)
     }
 }

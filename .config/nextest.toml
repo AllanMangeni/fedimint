@@ -1,0 +1,20 @@
+[profile.default]
+fail-fast = true
+failure-output = "immediate"
+# no matter the profile, we want to kill tests that hanged on something
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# define `dev` to allow running cargo and nextest with the same profile name
+# inherits default profile config
+[profile.dev]
+
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+# ccov seems MUCH slower, especially in Nix sandbox
+# possibly due to writing to a shared tracing file(?)
+[profile.nix-ccov]
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.release]
+slow-timeout = { period = "30s", terminate-after = 4 }

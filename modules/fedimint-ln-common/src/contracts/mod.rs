@@ -3,11 +3,11 @@ pub mod outgoing;
 
 use std::io::Error;
 
-use bitcoin_hashes::sha256::Hash as Sha256;
-use bitcoin_hashes::{hash_newtype, Hash as BitcoinHash};
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::{Hash as BitcoinHash, hash_newtype};
 use fedimint_core::encoding::{Decodable, DecodeError, Encodable};
 use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::OutPoint;
+use fedimint_core::{OutPoint, secp256k1};
 use serde::{Deserialize, Serialize};
 
 /// Anything representing a contract which thus has an associated [`ContractId`]
@@ -16,10 +16,8 @@ pub trait IdentifiableContract: Encodable {
 }
 
 hash_newtype!(
-    ContractId,
-    Sha256,
-    32,
-    doc = "The hash of a LN incoming contract"
+    /// The hash of a LN incoming contract
+    pub struct ContractId(Sha256);
 );
 
 /// A contract before execution as found in transaction outputs
@@ -102,40 +100,43 @@ impl Contract {
 }
 
 impl Encodable for ContractId {
-    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
-        self.as_inner().consensus_encode(writer)
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), Error> {
+        self.to_byte_array().consensus_encode(writer)
     }
 }
 
 impl Decodable for ContractId {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_partial<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        Ok(ContractId::from_inner(Decodable::consensus_decode(
-            d, modules,
-        )?))
+        Ok(ContractId::from_byte_array(
+            Decodable::consensus_decode_partial(d, modules)?,
+        ))
     }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct Preimage(pub [u8; 32]);
 
-impl Preimage {
-    /// Create a Schnorr public key from this preimage
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct PreimageKey(#[serde(with = "serde_big_array::BigArray")] pub [u8; 33]);
+
+impl PreimageKey {
+    /// Create a Schnorr public key
     ///
     /// # Errors
     ///
     /// Returns [`secp256k1::Error::InvalidPublicKey`] if the Preimage does not
     /// represent a valid Secp256k1 point x coordinate.
-    pub fn to_public_key(&self) -> Result<secp256k1::XOnlyPublicKey, secp256k1::Error> {
-        secp256k1::XOnlyPublicKey::from_slice(&self.0)
+    pub fn to_public_key(&self) -> Result<secp256k1::PublicKey, secp256k1::Error> {
+        secp256k1::PublicKey::from_slice(&self.0)
     }
 }
 
-/// Possible outcomes of preimage decryption
+/// Current status of preimage decryption
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
-pub enum DecryptedPreimage {
+pub enum DecryptedPreimageStatus {
     /// There aren't enough decryption shares yet
     Pending,
     /// The decrypted preimage was valid
@@ -144,65 +145,35 @@ pub enum DecryptedPreimage {
     Invalid,
 }
 
+/// Possible outcomes of preimage decryption
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub enum DecryptedPreimage {
+    /// There aren't enough decryption shares yet
+    Pending,
+    /// The decrypted preimage was valid
+    Some(PreimageKey),
+    /// The decrypted preimage was invalid
+    Invalid,
+}
+
 impl DecryptedPreimage {
     pub fn is_permanent(&self) -> bool {
         match self {
             DecryptedPreimage::Pending => false,
-            DecryptedPreimage::Some(_) => true,
-            DecryptedPreimage::Invalid => true,
+            DecryptedPreimage::Some(_) | DecryptedPreimage::Invalid => true,
         }
     }
 }
 /// Threshold-encrypted [`Preimage`]
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Encodable, Decodable, Deserialize, Serialize)]
 pub struct EncryptedPreimage(pub threshold_crypto::Ciphertext);
 
 /// Share to decrypt an [`EncryptedPreimage`]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encodable, Decodable, Serialize, Deserialize)]
 pub struct PreimageDecryptionShare(pub threshold_crypto::DecryptionShare);
 
 impl EncryptedPreimage {
-    pub fn new(preimage: Preimage, key: &threshold_crypto::PublicKey) -> EncryptedPreimage {
-        EncryptedPreimage(key.encrypt(preimage.0))
-    }
-}
-
-impl Encodable for EncryptedPreimage {
-    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
-        // TODO: get rid of bincode
-        let bytes = bincode::serialize(&self.0).expect("Serialization shouldn't fail");
-        bytes.consensus_encode(writer)
-    }
-}
-
-impl Decodable for EncryptedPreimage {
-    fn consensus_decode<D: std::io::Read>(
-        d: &mut D,
-        modules: &ModuleDecoderRegistry,
-    ) -> Result<Self, DecodeError> {
-        let bytes = Vec::<u8>::consensus_decode(d, modules)?;
-        Ok(EncryptedPreimage(
-            bincode::deserialize(&bytes).map_err(DecodeError::from_err)?,
-        ))
-    }
-}
-
-impl Encodable for PreimageDecryptionShare {
-    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
-        // TODO: get rid of bincode
-        let bytes = bincode::serialize(&self.0).expect("Serialization shouldn't fail");
-        bytes.consensus_encode(writer)
-    }
-}
-
-impl Decodable for PreimageDecryptionShare {
-    fn consensus_decode<D: std::io::Read>(
-        d: &mut D,
-        modules: &ModuleDecoderRegistry,
-    ) -> Result<Self, DecodeError> {
-        let bytes = Vec::<u8>::consensus_decode(d, modules)?;
-        Ok(PreimageDecryptionShare(
-            bincode::deserialize(&bytes).map_err(DecodeError::from_err)?,
-        ))
+    pub fn new(preimage_key: &PreimageKey, key: &threshold_crypto::PublicKey) -> EncryptedPreimage {
+        EncryptedPreimage(key.encrypt(preimage_key.0))
     }
 }

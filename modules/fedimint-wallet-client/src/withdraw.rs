@@ -1,21 +1,26 @@
-use std::time::Duration;
-
 use bitcoin::Txid;
-use fedimint_client::sm::{OperationId, State, StateTransition};
-use fedimint_client::DynGlobalClientContext;
-use fedimint_core::api::GlobalFederationApi;
-use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_api_client::api::{FederationApiExt, deserialize_outcome};
+use fedimint_client_module::DynGlobalClientContext;
+use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
 use fedimint_core::OutPoint;
+use fedimint_core::core::OperationId;
+use fedimint_core::encoding::{Decodable, Encodable};
+#[allow(deprecated)]
+use fedimint_core::endpoint_constants::AWAIT_OUTPUT_OUTCOME_ENDPOINT;
+use fedimint_core::module::ApiRequestErased;
 use fedimint_wallet_common::WalletOutputOutcome;
+use futures::future::pending;
+use tracing::warn;
 
 use crate::WalletClientContext;
+use crate::events::WithdrawRequest;
 
 // TODO: track tx confirmations
 #[aquamarine::aquamarine]
 /// graph LR
 ///     Created --> Success
 ///     Created --> Aborted
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct WithdrawStateMachine {
     pub(crate) operation_id: OperationId,
     pub(crate) state: WithdrawStates,
@@ -23,13 +28,13 @@ pub struct WithdrawStateMachine {
 
 impl State for WithdrawStateMachine {
     type ModuleContext = WalletClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
+        let wallet_context = context.clone();
         match &self.state {
             WithdrawStates::Created(created) => {
                 vec![StateTransition::new(
@@ -38,13 +43,17 @@ impl State for WithdrawStateMachine {
                         context.clone(),
                         created.clone(),
                     ),
-                    |_dbtx, res, old_state| Box::pin(transition_withdraw_processed(res, old_state)),
+                    move |dbtx, res, old_state| {
+                        Box::pin(transition_withdraw_processed(
+                            res,
+                            old_state,
+                            wallet_context.clone(),
+                            dbtx,
+                        ))
+                    },
                 )]
             }
-            WithdrawStates::Success(_) => {
-                vec![]
-            }
-            WithdrawStates::Aborted(_) => {
+            WithdrawStates::Success(_) | WithdrawStates::Aborted(_) => {
                 vec![]
             }
         }
@@ -61,20 +70,40 @@ async fn await_withdraw_processed(
     created: CreatedWithdrawState,
 ) -> Result<Txid, String> {
     global_context
+        .await_tx_accepted(created.fm_outpoint.txid)
+        .await?;
+
+    #[allow(deprecated)]
+    let outcome = global_context
         .api()
-        .await_output_outcome::<WalletOutputOutcome>(
-            created.fm_outpoint,
-            Duration::MAX,
-            &context.wallet_decoder,
+        .request_current_consensus_retry(
+            AWAIT_OUTPUT_OUTCOME_ENDPOINT.to_owned(),
+            ApiRequestErased::new(created.fm_outpoint),
         )
-        .await
-        .map(|outcome| outcome.0)
+        .await;
+
+    match deserialize_outcome::<WalletOutputOutcome>(&outcome, &context.wallet_decoder)
         .map_err(|e| e.to_string())
+        .and_then(|outcome| {
+            outcome
+                .ensure_v0_ref()
+                .map(|outcome| outcome.0)
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(txid) => Ok(txid),
+        Err(e) => {
+            warn!("Failed to process wallet output outcome: {e}");
+
+            pending().await
+        }
+    }
 }
 
 async fn transition_withdraw_processed(
     res: Result<Txid, String>,
     old_state: WithdrawStateMachine,
+    client_ctx: WalletClientContext,
+    dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
 ) -> WithdrawStateMachine {
     assert!(
         matches!(old_state.state, WithdrawStates::Created(_)),
@@ -83,7 +112,13 @@ async fn transition_withdraw_processed(
     );
 
     let new_state = match res {
-        Ok(txid) => WithdrawStates::Success(SuccessWithdrawState { txid }),
+        Ok(txid) => {
+            client_ctx
+                .client_ctx
+                .log_event(&mut dbtx.module_tx(), WithdrawRequest { txid })
+                .await;
+            WithdrawStates::Success(SuccessWithdrawState { txid })
+        }
         Err(error) => WithdrawStates::Aborted(AbortedWithdrawState { error }),
     };
 
@@ -93,24 +128,24 @@ async fn transition_withdraw_processed(
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum WithdrawStates {
     Created(CreatedWithdrawState),
     Success(SuccessWithdrawState),
     Aborted(AbortedWithdrawState),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct CreatedWithdrawState {
     pub(crate) fm_outpoint: OutPoint,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct SuccessWithdrawState {
     pub(crate) txid: Txid,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct AbortedWithdrawState {
     pub(crate) error: String,
 }

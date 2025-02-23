@@ -1,56 +1,68 @@
 [package]
 name = "fedimint-server"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
-description = "fedimint is the main consensus code for processing transactions and REST API"
-license = "MIT"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+description = "fedimint-server' facilitates federated consensus with atomic broadcast and distributed configuration."
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
 
 [lib]
 name = "fedimint_server"
 path = "src/lib.rs"
 
 [dependencies]
-fedimint-aead = { path = "../crypto/aead" }
-anyhow = "1.0.66"
-async-trait = "0.1.64"
-bincode = "1.3.1"
-bitcoin = "0.29.2"
-bitcoin_hashes = "0.11.0"
-bytes = "1.4.0"
-hbbft = { git = "https://github.com/fedimint/hbbft" }
-futures = "0.3.24"
-itertools = "0.10.5"
-fedimint-core = { path = "../fedimint-core" }
-fedimint-logging = { path = "../fedimint-logging" }
-rand = "0.8"
-rcgen = "=0.10.0"
-secp256k1-zkp = { version = "0.7.0", features = [ "global-context", "bitcoin_hashes" ] }
-serde = { version = "1.0.149", features = [ "derive" ] }
-serde_json = "1.0.91"
-sha3 = "0.10.5"
-strum = "0.24"
-strum_macros = "0.24"
-tbs = { path = "../crypto/tbs" }
-thiserror = "1.0.39"
-tracing ="0.1.37"
-url = { version = "2.3.1", features = ["serde"] }
-threshold_crypto = { git = "https://github.com/fedimint/threshold_crypto" }
-jsonrpsee = { version = "0.16.2", features = ["server"] }
-tokio = { version = "1.26.0", features = ["full"] }
-tokio-stream = "0.1.11"
-tokio-rustls = "0.23.4"
-tokio-util = { version = "0.7.4", features = [ "codec" ] }
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
+aleph-bft = { package = "fedimint-aleph-bft", version = "0.36.0", default-features = false }
+anyhow = { workspace = true }
+async-channel = { workspace = true } 
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc = { workspace = true }
+bls12_381 = { workspace = true }
+bs58 = "0.5.1"
+bytes = { workspace = true }
+fedimint-aead = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-bitcoind = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-metrics = { workspace = true }
+fedimint-server-core = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hyper = { workspace = true }
+iroh = { workspace = true }
+itertools = { workspace = true }
+jsonrpsee = { version = "0.24.8", features = ["server"] }
+parity-scale-codec = "3.7.4"
+pin-project = "1.1.9"
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rayon = { workspace = true }
+rcgen = "=0.13.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha3 = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+subtle = { workspace = true }
+tar = "0.4.43"
+tbs = { workspace = true }
+threshold_crypto = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { version = "0.7.13", features = ["codec"] }
+tower = { version = "0.4.13", default-features = false }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.4.0"
-fedimint-dummy-common = { path = "../modules/fedimint-dummy-common" }
-fedimint-dummy-server = { path = "../modules/fedimint-dummy-server" }
-fedimint-testing = { path = "../fedimint-testing" }
-test-log = { version = "0.2", features = [ "trace" ], default-features = false }
+test-log = { workspace = true }
 
 [build-dependencies]
-fedimint-build = { path = "../fedimint-build" }
+fedimint-build = { workspace = true }

@@ -1,3 +1,7 @@
+//! Federation-stored client backups
+//!
+//! Federations can store client-encrypted backups to help
+//! clients recover from a snapshot, instead of a blank slate.
 use std::time::SystemTime;
 
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -8,7 +12,7 @@ use crate::db::DbKeyPrefix;
 
 /// Key used to store user's ecash backups
 #[derive(Debug, Clone, Copy, Encodable, Decodable, Serialize)]
-pub struct ClientBackupKey(pub secp256k1_zkp::XOnlyPublicKey);
+pub struct ClientBackupKey(pub secp256k1::PublicKey);
 
 #[derive(Debug, Encodable, Decodable)]
 pub struct ClientBackupKeyPrefix;
@@ -26,4 +30,15 @@ pub struct ClientBackupSnapshot {
     pub timestamp: SystemTime,
     #[serde(with = "fedimint_core::hex::serde")]
     pub data: Vec<u8>,
+}
+
+/// Statistics about backups stored in the federation
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct BackupStatistics {
+    pub num_backups: usize,
+    pub total_size: usize,
+    pub refreshed_1d: usize,
+    pub refreshed_1w: usize,
+    pub refreshed_1m: usize,
+    pub refreshed_3m: usize,
 }

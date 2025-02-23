@@ -5,11 +5,30 @@ use serde_json::Value;
 pub fn rust_log_full_enabled() -> bool {
     // this will be called only once per-thread for best performance
     thread_local!(static RUST_LOG_FULL: bool = {
-        std::env::var_os("RUST_LOG_FULL")
-            .map(|val| !val.is_empty())
-            .unwrap_or(false)
+        std::env::var_os("RUST_LOG_FULL").is_some_and(|val| !val.is_empty())
     });
     RUST_LOG_FULL.with(|x| *x)
+}
+
+/// Optional stacktrace formatting for errors.
+///
+/// Automatically use `Display` (no stacktrace) or `Debug` depending on
+/// `RUST_LOG_FULL` env variable.
+///
+/// Meant for logging errors.
+pub struct OptStacktrace<T>(pub T);
+
+impl<T> fmt::Display for OptStacktrace<T>
+where
+    T: fmt::Debug + fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if rust_log_full_enabled() {
+            fmt::Debug::fmt(&self.0, f)
+        } else {
+            fmt::Display::fmt(&self.0, f)
+        }
+    }
 }
 
 /// Use for displaying bytes in the logs
@@ -21,9 +40,9 @@ pub struct AbbreviateHexBytes<'a>(pub &'a [u8]);
 impl<'a> fmt::Display for AbbreviateHexBytes<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.len() <= 64 || rust_log_full_enabled() {
-            bitcoin_hashes::hex::format_hex(self.0, f)?;
+            fedimint_core::format_hex(self.0, f)?;
         } else {
-            bitcoin_hashes::hex::format_hex(&self.0[..64], f)?;
+            fedimint_core::format_hex(&self.0[..64], f)?;
             f.write_fmt(format_args!("-{}", self.0.len()))?;
         }
         Ok(())

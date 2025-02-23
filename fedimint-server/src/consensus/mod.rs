@@ -1,687 +1,466 @@
-#![allow(clippy::let_unit_value)]
-
+pub mod aleph_bft;
+pub mod api;
+pub mod db;
 pub mod debug;
-pub mod server;
+pub mod engine;
+pub mod transaction;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::iter::FromIterator;
+use std::collections::BTreeMap;
+use std::env;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use fedimint_core::config::ServerModuleGenRegistry;
-use fedimint_core::core::ModuleInstanceId;
-use fedimint_core::db::{Database, DatabaseTransaction};
-use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::epoch::*;
-use fedimint_core::module::audit::Audit;
-use fedimint_core::module::registry::{ModuleDecoderRegistry, ServerModuleRegistry};
-use fedimint_core::module::{ModuleError, TransactionItemAmount};
-use fedimint_core::server::DynVerificationCache;
-use fedimint_core::{timing, Amount, NumPeers, OutPoint, PeerId, TransactionId};
-use fedimint_logging::LOG_CONSENSUS;
-use futures::future::select_all;
-use futures::StreamExt;
-use hbbft::honey_badger::Batch;
-use itertools::Itertools;
-use thiserror::Error;
-use tracing::{error, info_span, instrument, trace, warn, Instrument};
+use anyhow::bail;
+use async_channel::Sender;
+use db::get_global_database_migrations;
+use fedimint_api_client::api::net::Connector;
+use fedimint_api_client::api::{DynGlobalApi, P2PConnectionStatus};
+use fedimint_core::config::P2PMessage;
+use fedimint_core::core::{ModuleInstanceId, ModuleKind};
+use fedimint_core::db::{Database, apply_migrations, apply_migrations_server_dbtx};
+use fedimint_core::envs::is_running_in_test_env;
+use fedimint_core::epoch::ConsensusItem;
+use fedimint_core::module::registry::ModuleRegistry;
+use fedimint_core::module::{ApiEndpoint, ApiError, ApiMethod, FEDIMINT_API_ALPN, IrohApiRequest};
+use fedimint_core::net::peers::DynP2PConnections;
+use fedimint_core::task::TaskGroup;
+use fedimint_core::{NumPeers, PeerId};
+use fedimint_logging::{LOG_CONSENSUS, LOG_CORE, LOG_NET_API};
+use fedimint_server_core::{DynServerModule, ServerModuleInitRegistry};
+use futures::FutureExt;
+use iroh::Endpoint;
+use iroh::endpoint::{ConnectionError, Incoming, RecvStream, SendStream};
+use jsonrpsee::server::ServerHandle;
+use serde_json::Value;
+use tokio::sync::watch;
+use tracing::{info, warn};
 
-use crate::config::ServerConfig;
-use crate::consensus::TransactionSubmissionError::TransactionReplayError;
-use crate::db::{
-    AcceptedTransactionKey, ClientConfigSignatureKey, ConsensusUpgradeKey, DropPeerKey,
-    DropPeerKeyPrefix, EpochHistoryKey, LastEpochKey, RejectedTransactionKey,
-};
-use crate::net::api::ConsensusApi;
-use crate::transaction::{Transaction, TransactionError};
+use crate::config::{ServerConfig, ServerConfigLocal};
+use crate::consensus::api::{ConsensusApi, server_endpoints};
+use crate::consensus::engine::ConsensusEngine;
+use crate::envs::{FM_DB_CHECKPOINT_RETENTION_DEFAULT, FM_DB_CHECKPOINT_RETENTION_ENV};
+use crate::net::api::announcement::get_api_urls;
+use crate::net::api::{ApiSecrets, HasApiContext, RpcHandlerCtx};
+use crate::{net, update_server_info_version_dbtx};
 
-pub type HbbftSerdeConsensusOutcome = hbbft::honey_badger::Batch<Vec<SerdeConsensusItem>, PeerId>;
-pub type HbbftConsensusOutcome = hbbft::honey_badger::Batch<Vec<ConsensusItem>, PeerId>;
-pub type HbbftMessage = hbbft::honey_badger::Message<PeerId>;
+/// How many txs can be stored in memory before blocking the API
+const TRANSACTION_BUFFER: usize = 1000;
 
-// TODO remove HBBFT `Batch` from `ConsensusOutcome`
-#[derive(Debug, Clone)]
-pub struct ConsensusOutcomeConversion(pub HbbftConsensusOutcome);
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    connections: DynP2PConnections<P2PMessage>,
+    p2p_status_receivers: BTreeMap<PeerId, watch::Receiver<P2PConnectionStatus>>,
+    api_bind_addr: SocketAddr,
+    cfg: ServerConfig,
+    db: Database,
+    module_init_registry: ServerModuleInitRegistry,
+    task_group: &TaskGroup,
+    force_api_secrets: ApiSecrets,
+    data_dir: PathBuf,
+    code_version_str: String,
+) -> anyhow::Result<()> {
+    cfg.validate_config(&cfg.local.identity, &module_init_registry)?;
 
-impl PartialEq<Self> for ConsensusOutcomeConversion {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.epoch.eq(&other.0.epoch) && self.0.contributions.eq(&other.0.contributions)
-    }
-}
+    let mut global_dbtx = db.begin_transaction().await;
+    apply_migrations_server_dbtx(
+        &mut global_dbtx.to_ref_nc(),
+        "fedimint-server".to_string(),
+        get_global_database_migrations(),
+    )
+    .await?;
 
-impl From<EpochOutcome> for ConsensusOutcomeConversion {
-    fn from(history: EpochOutcome) -> Self {
-        ConsensusOutcomeConversion(Batch {
-            epoch: history.epoch,
-            contributions: BTreeMap::from_iter(history.items.into_iter()),
-        })
-    }
-}
+    update_server_info_version_dbtx(&mut global_dbtx.to_ref_nc(), &code_version_str).await;
+    global_dbtx.commit_tx_result().await?;
 
-/// Proposed HBBFT consensus changes including removing peers
-#[derive(Debug, Clone)]
-pub struct ConsensusProposal {
-    pub items: Vec<ConsensusItem>,
-    pub drop_peers: Vec<PeerId>,
-    pub force_new_epoch: bool,
-}
+    let mut modules = BTreeMap::new();
 
-/// Events that can be sent from the API to consensus thread
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub enum ApiEvent {
-    Transaction(Transaction),
-    UpgradeSignal,
-    ForceProcessOutcome(EpochOutcome),
-}
-
-// TODO: we should make other fields private and get rid of this
-#[non_exhaustive]
-pub struct FedimintConsensus {
-    /// Configuration describing the federation and containing our secrets
-    pub cfg: ServerConfig,
-    /// Modules config gen information
-    pub module_inits: ServerModuleGenRegistry,
-    /// Modules registered with the federation
-    pub modules: ServerModuleRegistry,
-    /// Database storing the result of processing consensus outcomes
-    pub db: Database,
-    /// API for accessing state
-    pub api: ConsensusApi,
-    /// Cache of `ApiEvent` to include in a proposal
-    pub api_event_cache: HashSet<ApiEvent>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Encodable, Decodable)]
-pub struct AcceptedTransaction {
-    pub epoch: u64,
-    pub transaction: Transaction,
-}
-
-#[derive(Debug)]
-struct VerificationCaches {
-    caches: HashMap<ModuleInstanceId, DynVerificationCache>,
-}
-
-pub struct FundingVerifier {
-    input_amount: Amount,
-    output_amount: Amount,
-    fee_amount: Amount,
-}
-
-impl VerificationCaches {
-    fn get_cache(&self, module_key: ModuleInstanceId) -> &DynVerificationCache {
-        self.caches
-            .get(&module_key)
-            .expect("Verification caches were built for all modules")
-    }
-}
-
-impl FedimintConsensus {
-    pub fn decoders(&self) -> ModuleDecoderRegistry {
-        self.modules.decoder_registry()
-    }
-
-    /// Calculate the result of the `consensus_outcome` and save it/them.
-    ///
-    /// `reference_rejected_txs` should be `Some` if the `consensus_outcome` is
-    /// coming from a a reference (already signed) `OutcomeHistory`, that
-    /// contains `rejected_txs`, so we can check it against our own
-    /// `rejected_txs` we calculate in this function.
-    ///
-    /// **Note**: `reference_rejected_txs` **must** come from a
-    /// validated/trustworthy source and be correct, or it can cause a
-    /// panic.
-    #[instrument(skip_all, fields(epoch = consensus_outcome.epoch))]
-    pub async fn process_consensus_outcome(
-        &self,
-        consensus_outcome: HbbftConsensusOutcome,
-        reference_rejected_txs: Option<BTreeSet<TransactionId>>,
-    ) -> SignedEpochOutcome {
-        let _timing /* logs on drop */ = timing::TimeReporter::new("process_consensus_outcome");
-        let epoch_history = self
-            .db
-            .autocommit(
-                |dbtx| {
-                    let consensus_outcome = consensus_outcome.clone();
-                    let reference_rejected_txs = reference_rejected_txs.clone();
-                    let peers: BTreeSet<PeerId> = consensus_outcome.contributions.keys().copied().collect();
-
-                    Box::pin(async move {
-                        let epoch = consensus_outcome.epoch;
-                        let outcome = consensus_outcome.clone();
-
-                        let UnzipConsensusItem {
-                            epoch_outcome_signature_share: _epoch_outcome_signature_share_cis,
-                            client_config_signature_share: _client_config_signature_share_cis,
-                            transaction: transaction_cis,
-                            consensus_upgrade: consensus_upgrade_cis,
-                            module: module_cis,
-                        } = consensus_outcome
-                            .contributions
-                            .into_iter()
-                            .flat_map(|(peer, cis)| cis.into_iter().map(move |ci| (peer, ci)))
-                            .unzip_consensus_item();
-
-                        self.process_module_consensus_items(dbtx, &module_cis, &peers).await;
-                        self.process_upgrade_items(dbtx, &consensus_upgrade_cis).await;
-
-                        let rejected_txs = self
-                            .process_transactions(dbtx, epoch, &transaction_cis)
-                            .await;
-
-                        if let Some(reference_rejected_txs) = reference_rejected_txs.as_ref() {
-                            // Result of the consensus are supposed to be deterministic.
-                            // If our result is not the same as what the (honest) majority of the federation
-                            // signed over, it's a catastrophical bug/mismatch of Federation's fedimintd
-                            // implementations.
-                            assert_eq!(
-                                reference_rejected_txs, &rejected_txs,
-                                "rejected_txs mismatch: reference = {reference_rejected_txs:?} != {rejected_txs:?}"
-                            );
-                        }
-
-                        let epoch_history = self
-                            .finalize_process_epoch(dbtx, outcome.clone(), rejected_txs, &peers)
-                            .await;
-                        Result::<_, ()>::Ok(epoch_history)
-                    })
-                },
-                Some(100),
-            )
-            .await
-            .expect("Committing consensus epoch failed");
-
-        let audit = self.audit().await;
-        if audit.sum().milli_sat < 0 {
-            panic!("Balance sheet of the fed has gone negative, this should never happen! {audit}")
-        }
-
-        epoch_history
-    }
-
-    /// Calls `begin_consensus_epoch` on all modules, dispatching their
-    /// consensus items
-    async fn process_module_consensus_items(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        module_cis: &[(PeerId, fedimint_core::core::DynModuleConsensusItem)],
-        consensus_peers: &BTreeSet<PeerId>,
-    ) {
-        let _timing /* logs on drop */ = timing::TimeReporter::new("process_module_consensus_items");
-        let mut drop_peers = vec![];
-        let per_module_cis: HashMap<
-            ModuleInstanceId,
-            Vec<(PeerId, fedimint_core::core::DynModuleConsensusItem)>,
-        > = module_cis
+    // TODO: make it work with all transports and federation secrets
+    let global_api = DynGlobalApi::from_endpoints(
+        cfg.consensus
+            .api_endpoints()
             .iter()
-            .cloned()
-            .into_group_map_by(|(_peer, mci)| mci.module_instance_id());
+            .map(|(&peer_id, url)| (peer_id, url.url.clone())),
+        &None,
+        &Connector::Tcp,
+    );
+    let shared_anymap = Arc::new(RwLock::new(BTreeMap::default()));
 
-        for (module_key, module_cis) in per_module_cis {
-            let moduletx = &mut dbtx.with_module_prefix(module_key);
-            let mut module_drop_peers = self
-                .modules
-                .get_expect(module_key)
-                .begin_consensus_epoch(moduletx, module_cis, consensus_peers)
-                .await;
-            drop_peers.append(&mut module_drop_peers);
-        }
+    for (module_id, module_cfg) in &cfg.consensus.modules {
+        match module_init_registry.get(&module_cfg.kind) {
+            Some(module_init) => {
+                info!(target: LOG_CORE, "Initialise module {module_id}");
 
-        for peer in drop_peers {
-            dbtx.insert_entry(&DropPeerKey(peer), &()).await;
-        }
-    }
+                apply_migrations(
+                    &db,
+                    module_init.module_kind().to_string(),
+                    module_init.get_database_migrations(),
+                    Some(*module_id),
+                    None,
+                )
+                .await?;
 
-    /// Applies all valid fedimint transactions to the database transaction
-    /// `dbtx` and returns a set of invalid transactions that were filtered
-    /// out
-    async fn process_transactions(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        epoch: u64,
-        transactions: &[(PeerId, Transaction)],
-    ) -> BTreeSet<TransactionId> {
-        let _timing /* logs on drop */ = timing::TimeReporter::new("process_transactions");
-        // Process transactions
-        let mut rejected_txs: BTreeSet<TransactionId> = BTreeSet::new();
+                let module = module_init
+                    .init(
+                        NumPeers::from(cfg.consensus.api_endpoints().len()),
+                        cfg.get_module_config(*module_id)?,
+                        db.with_prefix_module_id(*module_id).0,
+                        task_group,
+                        cfg.local.identity,
+                        global_api.with_module(*module_id),
+                        shared_anymap.clone(),
+                    )
+                    .await?;
 
-        let caches = self.build_verification_caches(transactions.iter().map(|(_, tx)| tx));
-        let mut processed_txs: HashSet<TransactionId> = HashSet::new();
-
-        for (_, transaction) in transactions.iter().cloned() {
-            let txid: TransactionId = transaction.tx_hash();
-            if !processed_txs.insert(txid) {
-                // Avoid processing duplicate tx from different peers
-                continue;
+                modules.insert(*module_id, (module_cfg.kind.clone(), module));
             }
-
-            let span = info_span!("Processing transaction");
-            async {
-                trace!(?transaction);
-
-                dbtx.set_tx_savepoint()
-                    .await
-                    .expect("Error setting transaction savepoint");
-                // TODO: use borrowed transaction
-                match self
-                    .process_transaction(dbtx, transaction.clone(), &caches)
-                    .await
-                {
-                    Ok(()) => {
-                        dbtx.insert_entry(
-                            &AcceptedTransactionKey(txid),
-                            &AcceptedTransaction { epoch, transaction },
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        rejected_txs.insert(txid);
-                        dbtx.rollback_tx_to_savepoint()
-                            .await
-                            .expect("Error rolling back to transaction savepoint");
-                        warn!(target: LOG_CONSENSUS, %error, "Transaction failed");
-                        // do not insert a RejectedTransactionKey because there must already be
-                        // AcceptedTransactionKey
-                        if !matches!(error, TransactionReplayError(_)) {
-                            dbtx.insert_entry(&RejectedTransactionKey(txid), &format!("{error:?}"))
-                                .await;
-                        }
-                    }
-                }
-            }
-            .instrument(span)
-            .await;
-        }
-
-        rejected_txs
-    }
-
-    /// Saves the epoch history, calls `end_consensus_epoch` on all modules and
-    /// bans misbehaving peers
-    async fn finalize_process_epoch(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        outcome: HbbftConsensusOutcome,
-        rejected_txs: BTreeSet<TransactionId>,
-        consensus_peers: &BTreeSet<PeerId>,
-    ) -> SignedEpochOutcome {
-        let _timing /* logs on drop */ = timing::TimeReporter::new("finalize_process_epoch");
-        let mut drop_peers = Vec::<PeerId>::new();
-
-        self.save_client_config_sig(dbtx, &outcome, &mut drop_peers)
-            .await;
-
-        let epoch_history = self
-            .save_epoch_history(outcome.clone(), dbtx, &mut drop_peers, rejected_txs)
-            .await;
-
-        for (module_key, _, module) in self.modules.iter_modules() {
-            let module_drop_peers = module
-                .end_consensus_epoch(consensus_peers, &mut dbtx.with_module_prefix(module_key))
-                .await;
-            drop_peers.extend(module_drop_peers);
-        }
-
-        for peer in drop_peers {
-            dbtx.insert_entry(&DropPeerKey(peer), &()).await;
-        }
-
-        epoch_history
-    }
-
-    /// If the client config hash isn't already signed, aggregate signature
-    /// shares from peers dropping those that don't contribute.
-    async fn save_client_config_sig(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        outcome: &HbbftConsensusOutcome,
-        drop_peers: &mut Vec<PeerId>,
-    ) {
-        let sig = dbtx
-            .get_isolated()
-            .get_value(&ClientConfigSignatureKey)
-            .await;
-
-        if sig.is_none() {
-            let _timing /* logs on drop */ = timing::TimeReporter::new("combine and verify client config sigs");
-            let client_hash = self.api.client_cfg.consensus_hash();
-            let peers: Vec<PeerId> = outcome.contributions.keys().cloned().collect();
-            let pks = self.cfg.consensus.auth_pk_set.clone();
-
-            let shares: BTreeMap<_, _> = outcome
-                .contributions
-                .iter()
-                .flat_map(|(peer, items)| items.iter().map(|i| (*peer, i)))
-                .filter_map(|(peer, item)| match item {
-                    ConsensusItem::ClientConfigSignatureShare(sig) => Some((peer, sig.clone())),
-                    _ => None,
-                })
-                .collect();
-
-            match combine_sigs(&pks, &shares, &client_hash) {
-                Ok(final_sig) => {
-                    assert!(pks.public_key().verify(&final_sig.0, client_hash));
-                    dbtx.insert_entry(&ClientConfigSignatureKey, &final_sig)
-                        .await;
-                }
-                Err(contributing_peers) => {
-                    warn!(
-                        target: LOG_CONSENSUS,
-                        "Did not receive enough valid client config sig shares"
-                    );
-                    for peer in peers {
-                        if !contributing_peers.contains(&peer) {
-                            drop_peers.push(peer);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Adds any new upgrade items to the set of signaling peers
-    async fn process_upgrade_items(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        upgrade_signals: &[(PeerId, ConsensusUpgrade)],
-    ) {
-        if !upgrade_signals.is_empty() {
-            let _timing /* logs on drop */ = timing::TimeReporter::new("process_upgrade_items");
-            let maybe_exists = dbtx.get_value(&ConsensusUpgradeKey).await;
-            let mut peers = maybe_exists.unwrap_or_default();
-            peers.extend(upgrade_signals.iter().map(|(peer, _)| peer));
-            dbtx.insert_entry(&ConsensusUpgradeKey, &peers).await;
-        }
-    }
-
-    /// Returns true if a threshold of peers have signaled to upgrade
-    pub async fn is_at_upgrade_threshold(&self) -> bool {
-        self.db
-            .begin_transaction()
-            .await
-            .get_value(&ConsensusUpgradeKey)
-            .await
-            .filter(|peers| peers.len() >= self.cfg.consensus.api_endpoints.threshold())
-            .is_some()
-    }
-
-    async fn save_epoch_history<'a>(
-        &self,
-        outcome: HbbftConsensusOutcome,
-        dbtx: &mut DatabaseTransaction<'a>,
-        drop_peers: &mut Vec<PeerId>,
-        rejected_txs: BTreeSet<TransactionId>,
-    ) -> SignedEpochOutcome {
-        let prev_epoch_key = EpochHistoryKey(outcome.epoch.saturating_sub(1));
-        let peers: Vec<PeerId> = outcome.contributions.keys().cloned().collect();
-        let maybe_prev_epoch = dbtx.get_value(&prev_epoch_key).await;
-
-        let current = SignedEpochOutcome::new(
-            outcome.epoch,
-            outcome.contributions,
-            rejected_txs,
-            maybe_prev_epoch.as_ref(),
-        );
-
-        // validate and update sigs on prev epoch
-        if let Some(prev_epoch) = maybe_prev_epoch {
-            let pks = &self.cfg.consensus.epoch_pk_set;
-
-            match current.add_sig_to_prev(pks, prev_epoch) {
-                Ok(prev_epoch) => {
-                    dbtx.insert_entry(&prev_epoch_key, &prev_epoch).await;
-                }
-                Err(EpochVerifyError::NotEnoughValidSigShares(contributing_peers)) => {
-                    warn!(
-                        target: LOG_CONSENSUS,
-                        "Unable to sign epoch {}", prev_epoch_key.0
-                    );
-                    for peer in peers {
-                        if !contributing_peers.contains(&peer) {
-                            warn!(
-                                target: LOG_CONSENSUS,
-                                "Dropping {} for not contributing valid epoch sigs.", peer
-                            );
-                            drop_peers.push(peer);
-                        }
-                    }
-                }
-                Err(_) => panic!("Not possible"),
-            }
-        }
-
-        dbtx.insert_entry(&LastEpochKey, &EpochHistoryKey(current.outcome.epoch))
-            .await;
-        dbtx.insert_entry(&EpochHistoryKey(current.outcome.epoch), &current)
-            .await;
-
-        current
-    }
-
-    pub async fn await_consensus_proposal(&self) {
-        let proposal_futures = self
-            .modules
-            .iter_modules()
-            .map(|(module_instance_id, _kind, module)| {
-                Box::pin(async move {
-                    let mut dbtx = self.db.begin_transaction().await;
-                    let mut module_dbtx = dbtx.with_module_prefix(module_instance_id);
-                    module.await_consensus_proposal(&mut module_dbtx).await
-                })
-            })
-            .collect::<Vec<_>>();
-
-        if !proposal_futures.is_empty() {
-            select_all(proposal_futures).await;
-        } else {
-            std::future::pending().await
-        }
-    }
-
-    pub async fn get_consensus_proposal(&self) -> ConsensusProposal {
-        let mut dbtx = self.db.begin_transaction().await;
-
-        let drop_peers = dbtx
-            .find_by_prefix(&DropPeerKeyPrefix)
-            .await
-            .map(|(key, _)| key.0)
-            .collect()
-            .await;
-
-        let mut items: Vec<ConsensusItem> = self
-            .api_event_cache
-            .iter()
-            .cloned()
-            .filter_map(|event| match event {
-                ApiEvent::Transaction(tx) => Some(ConsensusItem::Transaction(tx)),
-                ApiEvent::UpgradeSignal => Some(ConsensusItem::ConsensusUpgrade(ConsensusUpgrade)),
-                ApiEvent::ForceProcessOutcome(_) => None,
-            })
-            .collect();
-        let mut force_new_epoch = false;
-
-        for (instance_id, _, module) in self.modules.iter_modules() {
-            let consensus_proposal = module
-                .consensus_proposal(&mut dbtx.with_module_prefix(instance_id), instance_id)
-                .await;
-            if consensus_proposal.forces_new_epoch() {
-                force_new_epoch = true;
-            }
-
-            items.extend(
-                consensus_proposal
-                    .into_items()
-                    .into_iter()
-                    .map(ConsensusItem::Module),
-            );
-        }
-
-        if let Some(epoch) = dbtx.get_value(&LastEpochKey).await {
-            let last_epoch = dbtx.get_value(&epoch).await.unwrap();
-
-            let timing = timing::TimeReporter::new("sign last epoch key");
-            let sig = self.cfg.private.epoch_sks.0.sign(last_epoch.hash);
-            drop(timing);
-            let item = ConsensusItem::EpochOutcomeSignatureShare(SerdeSignatureShare(sig));
-            items.push(item);
+            None => bail!("Detected configuration for unsupported module id: {module_id}"),
         };
-
-        // Add a signature share for the client config hash if we don't have it signed
-        // yet
-        let sig = dbtx
-            .get_isolated()
-            .get_value(&ClientConfigSignatureKey)
-            .await;
-        if sig.is_none() {
-            let hash = self.api.client_cfg.consensus_hash();
-            let timing = timing::TimeReporter::new("sign client config");
-            let share = self.cfg.private.auth_sks.0.sign(hash);
-            drop(timing);
-            let item = ConsensusItem::ClientConfigSignatureShare(SerdeSignatureShare(share));
-            items.push(item);
-        }
-
-        ConsensusProposal {
-            items,
-            drop_peers,
-            force_new_epoch,
-        }
     }
 
-    async fn process_transaction<'a>(
-        &self,
-        dbtx: &mut DatabaseTransaction<'a>,
-        transaction: Transaction,
-        caches: &VerificationCaches,
-    ) -> Result<(), TransactionSubmissionError> {
-        let mut funding_verifier = FundingVerifier::default();
+    let module_registry = ModuleRegistry::from(modules);
 
-        let tx_hash = transaction.tx_hash();
+    let client_cfg = cfg.consensus.to_client_config(&module_init_registry)?;
 
-        if dbtx
-            .get_value(&AcceptedTransactionKey(tx_hash))
-            .await
-            .is_some()
-        {
-            return Err(TransactionReplayError(tx_hash));
-        }
+    let (submission_sender, submission_receiver) = async_channel::bounded(TRANSACTION_BUFFER);
+    let (shutdown_sender, shutdown_receiver) = watch::channel(None);
 
-        let mut pub_keys = Vec::new();
-        for input in transaction.inputs.iter() {
-            let meta = self
-                .modules
-                .get_expect(input.module_instance_id())
-                .apply_input(
-                    &mut dbtx.with_module_prefix(input.module_instance_id()),
-                    input,
-                    caches.get_cache(input.module_instance_id()),
+    let mut ci_status_senders = BTreeMap::new();
+    let mut ci_status_receivers = BTreeMap::new();
+
+    for peer in cfg.consensus.broadcast_public_keys.keys().copied() {
+        let (ci_sender, ci_receiver) = watch::channel(None);
+
+        ci_status_senders.insert(peer, ci_sender);
+        ci_status_receivers.insert(peer, ci_receiver);
+    }
+
+    let consensus_api = ConsensusApi {
+        cfg: cfg.clone(),
+        db: db.clone(),
+        modules: module_registry.clone(),
+        client_cfg: client_cfg.clone(),
+        submission_sender: submission_sender.clone(),
+        shutdown_sender,
+        shutdown_receiver: shutdown_receiver.clone(),
+        supported_api_versions: ServerConfig::supported_api_versions_summary(
+            &cfg.consensus.modules,
+            &module_init_registry,
+        ),
+        p2p_status_receivers,
+        ci_status_receivers,
+        force_api_secret: force_api_secrets.get_active(),
+        code_version_str,
+    };
+
+    info!(target: LOG_CONSENSUS, "Starting Consensus Api");
+
+    let api_handler = start_consensus_api(
+        &cfg.local,
+        consensus_api.clone(),
+        force_api_secrets.clone(),
+        api_bind_addr,
+    )
+    .await;
+
+    if let Some(iroh_api_sk) = cfg.private.iroh_api_sk.clone() {
+        start_iroh_api(iroh_api_sk, consensus_api, task_group).await;
+    }
+
+    info!(target: LOG_CONSENSUS, "Starting Submission of Module CI proposals");
+
+    for (module_id, kind, module) in module_registry.iter_modules() {
+        submit_module_ci_proposals(
+            task_group,
+            db.clone(),
+            module_id,
+            kind.clone(),
+            module.clone(),
+            submission_sender.clone(),
+        );
+    }
+
+    let checkpoint_retention: String = env::var(FM_DB_CHECKPOINT_RETENTION_ENV)
+        .unwrap_or(FM_DB_CHECKPOINT_RETENTION_DEFAULT.to_string());
+    let checkpoint_retention = checkpoint_retention.parse().unwrap_or_else(|_| {
+        panic!("FM_DB_CHECKPOINT_RETENTION_ENV var is invalid: {checkpoint_retention}")
+    });
+
+    info!(target: LOG_CONSENSUS, "Starting Consensus Engine");
+
+    let api_urls = get_api_urls(&db, &cfg.consensus).await;
+
+    // FIXME: (@leonardo) How should this be handled ?
+    // Using the `Connector::default()` for now!
+    ConsensusEngine {
+        db,
+        federation_api: DynGlobalApi::from_endpoints(
+            api_urls,
+            &force_api_secrets.get_active(),
+            &Connector::default(),
+        ),
+        self_id_str: cfg.local.identity.to_string(),
+        peer_id_str: (0..cfg.consensus.api_endpoints().len())
+            .map(|x| x.to_string())
+            .collect(),
+        cfg: cfg.clone(),
+        connections,
+        ci_status_senders,
+        submission_receiver,
+        shutdown_receiver,
+        modules: module_registry,
+        task_group: task_group.clone(),
+        data_dir,
+        checkpoint_retention,
+    }
+    .run()
+    .await?;
+
+    api_handler
+        .stop()
+        .expect("Consensus api should still be running");
+
+    api_handler.stopped().await;
+
+    Ok(())
+}
+
+async fn start_consensus_api(
+    cfg: &ServerConfigLocal,
+    api: ConsensusApi,
+    force_api_secrets: ApiSecrets,
+    api_bind: SocketAddr,
+) -> ServerHandle {
+    let mut rpc_module = RpcHandlerCtx::new_module(api.clone());
+
+    net::api::attach_endpoints(&mut rpc_module, api::server_endpoints(), None);
+
+    for (id, _, module) in api.modules.iter_modules() {
+        net::api::attach_endpoints(&mut rpc_module, module.api_endpoints(), Some(id));
+    }
+
+    net::api::spawn(
+        "consensus",
+        api_bind,
+        rpc_module,
+        cfg.max_connections,
+        force_api_secrets,
+    )
+    .await
+}
+
+const CONSENSUS_PROPOSAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn submit_module_ci_proposals(
+    task_group: &TaskGroup,
+    db: Database,
+    module_id: ModuleInstanceId,
+    kind: ModuleKind,
+    module: DynServerModule,
+    submission_sender: Sender<ConsensusItem>,
+) {
+    let mut interval = tokio::time::interval(if is_running_in_test_env() {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(1)
+    });
+
+    task_group.spawn(
+        format!("citem_proposals_{module_id}"),
+        move |task_handle| async move {
+            while !task_handle.is_shutting_down() {
+                let module_consensus_items = tokio::time::timeout(
+                    CONSENSUS_PROPOSAL_TIMEOUT,
+                    module.consensus_proposal(
+                        &mut db
+                            .begin_transaction_nc()
+                            .await
+                            .to_ref_with_prefix_module_id(module_id)
+                            .0
+                            .into_nc(),
+                        module_id,
+                    ),
                 )
-                .await
-                .map_err(|e| TransactionSubmissionError::ModuleError(tx_hash, e))?;
-            pub_keys.push(meta.pub_keys);
-            funding_verifier.add_input(meta.amount);
+                .await;
+
+                match module_consensus_items {
+                    Ok(items) => {
+                        for item in items {
+                            if submission_sender
+                                .send(ConsensusItem::Module(item))
+                                .await
+                                .is_err()
+                            {
+                                warn!(
+                                    target: LOG_CONSENSUS,
+                                    module_id,
+                                    "Unable to submit module consensus item proposal via channel"
+                                );
+                            }
+                        }
+                    }
+                    Err(..) => {
+                        warn!(
+                            target: LOG_CONSENSUS,
+                            module_id,
+                            %kind,
+                            "Module failed to propose consensus items on time"
+                        );
+                    }
+                }
+
+                interval.tick().await;
+            }
+        },
+    );
+}
+
+async fn start_iroh_api(
+    secret_key: iroh::SecretKey,
+    consensus_api: ConsensusApi,
+    task_group: &TaskGroup,
+) {
+    let endpoint = Endpoint::builder()
+        .discovery_n0()
+        .secret_key(secret_key)
+        .alpns(vec![FEDIMINT_API_ALPN.to_vec()])
+        .bind()
+        .await
+        .expect("Failed to bind iroh api");
+
+    task_group.spawn_cancellable(
+        "iroh-api",
+        run_iroh_api(consensus_api, endpoint, task_group.clone()),
+    );
+}
+
+async fn run_iroh_api(consensus_api: ConsensusApi, endpoint: Endpoint, task_group: TaskGroup) {
+    let core_api = server_endpoints()
+        .into_iter()
+        .map(|endpoint| (endpoint.path.to_string(), endpoint))
+        .collect::<BTreeMap<String, ApiEndpoint<ConsensusApi>>>();
+
+    let module_api = consensus_api
+        .modules
+        .iter_modules()
+        .map(|(id, _, module)| {
+            let api_endpoints = module
+                .api_endpoints()
+                .into_iter()
+                .map(|endpoint| (endpoint.path.to_string(), endpoint))
+                .collect::<BTreeMap<String, ApiEndpoint<DynServerModule>>>();
+
+            (id, api_endpoints)
+        })
+        .collect::<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>();
+
+    let consensus_api = Arc::new(consensus_api);
+    let core_api = Arc::new(core_api);
+    let module_api = Arc::new(module_api);
+
+    loop {
+        match endpoint.accept().await {
+            Some(incoming) => {
+                task_group.spawn_cancellable(
+                    "handle-iroh-connection",
+                    handle_incoming(
+                        consensus_api.clone(),
+                        core_api.clone(),
+                        module_api.clone(),
+                        task_group.clone(),
+                        incoming,
+                    )
+                    .then(|result| async {
+                        if let Err(e) = result {
+                            warn!(target: LOG_NET_API, "Failed to handle iroh connection {e}");
+                        }
+                    }),
+                );
+            }
+            None => return,
         }
-        transaction.validate_signature(pub_keys.into_iter().flatten())?;
-
-        for (idx, output) in transaction.outputs.into_iter().enumerate() {
-            let out_point = OutPoint {
-                txid: tx_hash,
-                out_idx: idx as u64,
-            };
-            let amount = self
-                .modules
-                .get_expect(output.module_instance_id())
-                .apply_output(
-                    &mut dbtx.with_module_prefix(output.module_instance_id()),
-                    &output,
-                    out_point,
-                )
-                .await
-                .map_err(|e| TransactionSubmissionError::ModuleError(tx_hash, e))?;
-            funding_verifier.add_output(amount);
-        }
-
-        funding_verifier.verify_funding()?;
-
-        Ok(())
-    }
-
-    fn build_verification_caches<'a>(
-        &self,
-        transactions: impl Iterator<Item = &'a Transaction> + Send,
-    ) -> VerificationCaches {
-        let _timing /* logs on drop */ = timing::TimeReporter::new("build_verification_caches");
-        let module_inputs = transactions
-            .flat_map(|tx| tx.inputs.iter())
-            .cloned()
-            .into_group_map_by(|input| input.module_instance_id());
-
-        // TODO: should probably run in parallel, but currently only the mint does
-        // anything at all
-        let caches = module_inputs
-            .into_iter()
-            .map(|(module_key, inputs)| {
-                let module = self.modules.get_expect(module_key);
-                (module_key, module.build_verification_cache(&inputs))
-            })
-            .collect();
-
-        VerificationCaches { caches }
-    }
-
-    pub async fn audit(&self) -> Audit {
-        let _timing /* logs on drop */ = timing::TimeReporter::new("audit");
-        let mut dbtx = self.db.begin_transaction().await;
-        let mut audit = Audit::default();
-        for (module_instance_id, _, module) in self.modules.iter_modules() {
-            module
-                .audit(&mut dbtx.with_module_prefix(module_instance_id), &mut audit)
-                .await
-        }
-        audit
     }
 }
 
-impl FundingVerifier {
-    pub fn add_input(&mut self, input_amount: TransactionItemAmount) {
-        self.input_amount += input_amount.amount;
-        self.fee_amount += input_amount.fee;
-    }
+async fn handle_incoming(
+    consensus_api: Arc<ConsensusApi>,
+    core_api: Arc<BTreeMap<String, ApiEndpoint<ConsensusApi>>>,
+    module_api: Arc<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>,
+    task_group: TaskGroup,
+    incoming: Incoming,
+) -> anyhow::Result<()> {
+    let connection = incoming.accept()?.await?;
 
-    pub fn add_output(&mut self, output_amount: TransactionItemAmount) {
-        self.output_amount += output_amount.amount;
-        self.fee_amount += output_amount.fee;
-    }
+    loop {
+        let connection_result = connection.accept_bi().await;
 
-    pub fn verify_funding(self) -> Result<(), TransactionError> {
-        if self.input_amount == (self.output_amount + self.fee_amount) {
-            Ok(())
-        } else {
-            Err(TransactionError::UnbalancedTransaction {
-                inputs: self.input_amount,
-                outputs: self.output_amount,
-                fee: self.fee_amount,
-            })
-        }
-    }
-}
-
-impl Default for FundingVerifier {
-    fn default() -> Self {
-        FundingVerifier {
-            input_amount: Amount::ZERO,
-            output_amount: Amount::ZERO,
-            fee_amount: Amount::ZERO,
-        }
+        task_group.spawn_cancellable(
+            "handle-iroh-request",
+            handle_request(
+                consensus_api.clone(),
+                core_api.clone(),
+                module_api.clone(),
+                connection_result,
+            )
+            .then(|result| async {
+                if let Err(e) = result {
+                    warn!(target: LOG_NET_API, "Failed to handle iroh request {e}");
+                }
+            }),
+        );
     }
 }
 
-#[derive(Debug, Error)]
-pub enum TransactionSubmissionError {
-    #[error("High level transaction error: {0}")]
-    TransactionError(#[from] TransactionError),
-    #[error("Module input or output error in tx {0}: {1}")]
-    ModuleError(TransactionId, ModuleError),
-    #[error("Transaction channel was closed")]
-    TxChannelError,
-    #[error("Transaction was already successfully processed: {0}")]
-    TransactionReplayError(TransactionId),
+async fn handle_request(
+    consensus_api: Arc<ConsensusApi>,
+    core_api: Arc<BTreeMap<String, ApiEndpoint<ConsensusApi>>>,
+    module_api: Arc<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>,
+    connection_result: Result<(SendStream, RecvStream), ConnectionError>,
+) -> anyhow::Result<()> {
+    let (mut send_stream, mut receive_stream) = connection_result?;
+
+    let request = receive_stream.read_to_end(100_000).await?;
+
+    let request = serde_json::from_slice::<IrohApiRequest>(&request)?;
+
+    let response = await_response(consensus_api, core_api, module_api, request).await;
+
+    let response = serde_json::to_vec(&response)?;
+
+    send_stream.write_all(&response).await?;
+
+    send_stream.finish()?;
+
+    Ok(())
+}
+
+async fn await_response(
+    consensus_api: Arc<ConsensusApi>,
+    core_api: Arc<BTreeMap<String, ApiEndpoint<ConsensusApi>>>,
+    module_api: Arc<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>,
+    request: IrohApiRequest,
+) -> Result<Value, ApiError> {
+    match request.method {
+        ApiMethod::Core(method) => {
+            let endpoint = core_api.get(&method).ok_or(ApiError::not_found(method))?;
+
+            let (state, context) = consensus_api.context(&request.request, None).await;
+
+            (endpoint.handler)(state, context, request.request).await
+        }
+        ApiMethod::Module(module_id, method) => {
+            let endpoint = module_api
+                .get(&module_id)
+                .ok_or(ApiError::not_found(module_id.to_string()))?
+                .get(&method)
+                .ok_or(ApiError::not_found(method))?;
+
+            let (state, context) = consensus_api
+                .context(&request.request, Some(module_id))
+                .await;
+
+            (endpoint.handler)(state, context, request.request).await
+        }
+    }
 }

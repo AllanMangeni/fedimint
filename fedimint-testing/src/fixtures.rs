@@ -1,168 +1,237 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::env;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env, fs};
 
-use fedimint_bitcoind::create_bitcoind;
-use fedimint_client::module::gen::{ClientModuleGenRegistry, DynClientModuleGen, IClientModuleGen};
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
-use fedimint_core::config::{
-    ModuleGenParams, ServerModuleGenParamsRegistry, ServerModuleGenRegistry,
+use fedimint_bitcoind::{DynBitcoindRpc, create_bitcoind};
+use fedimint_client::module_init::{
+    ClientModuleInitRegistry, DynClientModuleInit, IClientModuleInit,
 };
+use fedimint_core::config::{ModuleInitParams, ServerModuleConfigGenParamsRegistry};
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
-use fedimint_core::module::{DynServerModuleGen, IServerModuleGen};
-use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
+use fedimint_core::db::Database;
+use fedimint_core::db::mem_impl::MemDatabase;
+use fedimint_core::envs::BitcoinRpcConfig;
+use fedimint_core::module::registry::ModuleRegistry;
+use fedimint_core::task::{MaybeSend, MaybeSync};
+use fedimint_core::util::SafeUrl;
+use fedimint_gateway_common::LightningMode;
+use fedimint_gateway_server::Gateway;
+use fedimint_gateway_server::client::GatewayClientBuilder;
+use fedimint_gateway_server::config::LightningModuleMode;
+use fedimint_lightning::{ILnRpcClient, LightningContext};
 use fedimint_logging::TracingSetup;
-use tempfile::TempDir;
+use fedimint_server::core::{DynServerModuleInit, IServerModuleInit, ServerModuleInitRegistry};
+use fedimint_testing_core::test_dir;
 
+use crate::btc::BitcoinTest;
 use crate::btc::mock::FakeBitcoinFactory;
 use crate::btc::real::RealBitcoinTest;
-use crate::btc::BitcoinTest;
-use crate::federation::FederationTest;
-use crate::gateway::GatewayTest;
-use crate::ln::mock::FakeLightningTest;
-use crate::ln::real::{ClnLightningTest, LndLightningTest};
-use crate::ln::LightningTest;
+use crate::envs::{
+    FM_PORT_ESPLORA_ENV, FM_TEST_BACKEND_BITCOIN_RPC_KIND_ENV, FM_TEST_BACKEND_BITCOIN_RPC_URL_ENV,
+    FM_TEST_BITCOIND_RPC_ENV, FM_TEST_USE_REAL_DAEMONS_ENV,
+};
+use crate::federation::{FederationTest, FederationTestBuilder};
+use crate::ln::FakeLightningTest;
 
 /// A default timeout for things happening in tests
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-static BASE_PORT: AtomicU16 = AtomicU16::new(18173);
+pub const DEFAULT_GATEWAY_PASSWORD: &str = "thereisnosecondbest";
 
 /// A tool for easily writing fedimint integration tests
 pub struct Fixtures {
-    num_peers: u16,
-    clients: Vec<DynClientModuleGen>,
-    servers: Vec<DynServerModuleGen>,
-    params: ServerModuleGenParamsRegistry,
-    primary_client: ModuleInstanceId,
+    clients: Vec<DynClientModuleInit>,
+    servers: Vec<DynServerModuleInit>,
+    params: ServerModuleConfigGenParamsRegistry,
     bitcoin_rpc: BitcoinRpcConfig,
     bitcoin: Arc<dyn BitcoinTest>,
+    dyn_bitcoin_rpc: DynBitcoindRpc,
+    primary_module_kind: ModuleKind,
     id: ModuleInstanceId,
 }
 
 impl Fixtures {
     pub fn new_primary(
-        client: impl IClientModuleGen + MaybeSend + MaybeSync + 'static,
-        server: impl IServerModuleGen + MaybeSend + MaybeSync + 'static,
-        params: impl ModuleGenParams,
+        client: impl IClientModuleInit + 'static,
+        server: impl IServerModuleInit + MaybeSend + MaybeSync + 'static,
+        params: impl ModuleInitParams,
     ) -> Self {
         // Ensure tracing has been set once
         let _ = TracingSetup::default().init();
         let real_testing = Fixtures::is_real_test();
-        let num_peers = match real_testing {
-            true => 2,
-            false => 1,
-        };
-        let task_group = TaskGroup::new();
-        let (bitcoin, config): (Arc<dyn BitcoinTest>, BitcoinRpcConfig) = match real_testing {
-            true => {
-                let rpc_config = BitcoinRpcConfig::from_env_vars().unwrap();
-                let bitcoin_rpc = create_bitcoind(&rpc_config, task_group.make_handle()).unwrap();
-                let bitcoincore_url = env::var("FM_TEST_BITCOIND_RPC")
-                    .expect("Must have bitcoind RPC defined for real tests")
-                    .parse()
-                    .expect("Invalid bitcoind RPC URL");
-                let bitcoin = RealBitcoinTest::new(&bitcoincore_url, bitcoin_rpc);
-                (Arc::new(bitcoin), rpc_config)
-            }
-            false => {
-                let FakeBitcoinFactory { bitcoin, config } = FakeBitcoinFactory::register_new();
-                (Arc::new(bitcoin), config)
-            }
+        let (dyn_bitcoin_rpc, bitcoin, config): (
+            DynBitcoindRpc,
+            Arc<dyn BitcoinTest>,
+            BitcoinRpcConfig,
+        ) = if real_testing {
+            // `backend-test.sh` overrides which Bitcoin RPC to use for electrs and esplora
+            // backend tests
+            let override_bitcoin_rpc_kind = env::var(FM_TEST_BACKEND_BITCOIN_RPC_KIND_ENV);
+            let override_bitcoin_rpc_url = env::var(FM_TEST_BACKEND_BITCOIN_RPC_URL_ENV);
+
+            let rpc_config = match (override_bitcoin_rpc_kind, override_bitcoin_rpc_url) {
+                (Ok(kind), Ok(url)) => BitcoinRpcConfig {
+                    kind: kind.parse().expect("must provide valid kind"),
+                    url: url.parse().expect("must provide valid url"),
+                },
+                _ => BitcoinRpcConfig::get_defaults_from_env_vars()
+                    .expect("must provide valid default env vars"),
+            };
+
+            let dyn_bitcoin_rpc = create_bitcoind(&rpc_config).unwrap();
+            let bitcoincore_url = env::var(FM_TEST_BITCOIND_RPC_ENV)
+                .expect("Must have bitcoind RPC defined for real tests")
+                .parse()
+                .expect("Invalid bitcoind RPC URL");
+            let bitcoin = RealBitcoinTest::new(&bitcoincore_url, dyn_bitcoin_rpc.clone());
+
+            (dyn_bitcoin_rpc, Arc::new(bitcoin), rpc_config)
+        } else {
+            let FakeBitcoinFactory { bitcoin, config } = FakeBitcoinFactory::register_new();
+            let dyn_bitcoin_rpc = DynBitcoindRpc::from(bitcoin.clone());
+            let bitcoin = Arc::new(bitcoin);
+            (dyn_bitcoin_rpc, bitcoin, config)
         };
 
         Self {
-            num_peers,
             clients: vec![],
             servers: vec![],
-            params: Default::default(),
-            primary_client: 0,
+            params: ModuleRegistry::default(),
             bitcoin_rpc: config,
             bitcoin,
+            dyn_bitcoin_rpc,
+            primary_module_kind: IClientModuleInit::module_kind(&client),
             id: 0,
         }
         .with_module(client, server, params)
     }
 
     pub fn is_real_test() -> bool {
-        env::var("FM_TEST_USE_REAL_DAEMONS") == Ok("1".to_string())
+        env::var(FM_TEST_USE_REAL_DAEMONS_ENV) == Ok("1".to_string())
     }
 
     // TODO: Auto-assign instance ids after removing legacy id order
     /// Add a module to the fed
     pub fn with_module(
         mut self,
-        client: impl IClientModuleGen + MaybeSend + MaybeSync + 'static,
-        server: impl IServerModuleGen + MaybeSend + MaybeSync + 'static,
-        params: impl ModuleGenParams,
+        client: impl IClientModuleInit + 'static,
+        server: impl IServerModuleInit + MaybeSend + MaybeSync + 'static,
+        params: impl ModuleInitParams,
     ) -> Self {
         self.params
-            .attach_config_gen_params(self.id, server.module_kind(), params);
-        self.clients.push(DynClientModuleGen::from(client));
-        self.servers.push(DynServerModuleGen::from(server));
+            .attach_config_gen_params_by_id(self.id, server.module_kind(), params);
+        self.clients.push(DynClientModuleInit::from(client));
+        self.servers.push(DynServerModuleInit::from(server));
         self.id += 1;
 
         self
     }
 
-    /// Starts a new federation with default number of peers for testing
-    pub async fn new_fed(&self) -> FederationTest {
-        self.new_fed_with_peers(self.num_peers).await
+    pub fn with_server_only_module(
+        mut self,
+        server: impl IServerModuleInit + MaybeSend + MaybeSync + 'static,
+        params: impl ModuleInitParams,
+    ) -> Self {
+        self.params
+            .attach_config_gen_params_by_id(self.id, server.module_kind(), params);
+        self.servers.push(DynServerModuleInit::from(server));
+        self.id += 1;
+
+        self
     }
 
-    /// Starts a new federation with number of peers
-    pub async fn new_fed_with_peers(&self, num_peers: u16) -> FederationTest {
-        FederationTest::new(
-            num_peers,
-            BASE_PORT.fetch_add(num_peers * 2, Ordering::Relaxed),
+    /// Starts a new federation with 3/4 peers online
+    pub async fn new_fed_degraded(&self) -> FederationTest {
+        self.new_fed_builder(1).build().await
+    }
+
+    /// Starts a new federation with 4/4 peers online
+    pub async fn new_fed_not_degraded(&self) -> FederationTest {
+        self.new_fed_builder(0).build().await
+    }
+
+    /// Creates a new `FederationTestBuilder` that can be used to build up a
+    /// `FederationTest` for module tests.
+    pub fn new_fed_builder(&self, num_offline: u16) -> FederationTestBuilder {
+        FederationTestBuilder::new(
             self.params.clone(),
-            ServerModuleGenRegistry::from(self.servers.clone()),
-            ClientModuleGenRegistry::from(self.clients.clone()),
-            self.primary_client,
+            ServerModuleInitRegistry::from(self.servers.clone()),
+            ClientModuleInitRegistry::from(self.clients.clone()),
+            self.primary_module_kind.clone(),
+            num_offline,
         )
-        .await
     }
 
-    /// Starts a new gateway with a given lightning node
-    pub async fn new_gateway(&self, ln: Arc<dyn LightningTest>) -> GatewayTest {
-        // TODO: Make construction easier
-        let server_gens = ServerModuleGenRegistry::from(self.servers.clone());
+    /// Creates a new Gateway that can be used for module tests.
+    pub async fn new_gateway(&self, lightning_module_mode: LightningModuleMode) -> Gateway {
+        let server_gens = ServerModuleInitRegistry::from(self.servers.clone());
         let module_kinds = self.params.iter_modules().map(|(id, kind, _)| (id, kind));
-        let decoders = server_gens.decoders(module_kinds).unwrap();
+        let decoders = server_gens.available_decoders(module_kinds).unwrap();
+        let gateway_db = Database::new(MemDatabase::new(), decoders.clone());
         let clients = self.clients.clone().into_iter();
 
-        GatewayTest::new(
-            BASE_PORT.fetch_add(1, Ordering::Relaxed),
-            rand::random::<u64>().to_string(),
-            ln,
-            decoders,
-            ClientModuleGenRegistry::from_iter(clients.filter(|client| {
+        let registry = clients
+            .filter(|client| {
                 // Remove LN module because the gateway adds one
                 client.to_dyn_common().module_kind() != ModuleKind::from_static_str("ln")
-            })),
+            })
+            .filter(|client| {
+                // Remove LN NG module because the gateway adds one
+                client.to_dyn_common().module_kind() != ModuleKind::from_static_str("lnv2")
+            })
+            .collect();
+
+        let (path, _config_dir) = test_dir(&format!("gateway-{}", rand::random::<u64>()));
+
+        // Create federation client builder for the gateway
+        let client_builder: GatewayClientBuilder =
+            GatewayClientBuilder::new(path.clone(), registry, ModuleKind::from_static_str("dummy"));
+
+        let ln_client: Arc<dyn ILnRpcClient> = Arc::new(FakeLightningTest::new());
+
+        let (lightning_public_key, lightning_alias, lightning_network, _, _) = ln_client
+            .parsed_node_info()
+            .await
+            .expect("Could not get Lightning info");
+        let lightning_context = LightningContext {
+            lnrpc: ln_client.clone(),
+            lightning_public_key,
+            lightning_alias,
+            lightning_network,
+        };
+
+        // Module tests do not use the webserver, so any port is ok
+        let listen: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let address: SafeUrl = format!("http://{listen}").parse().unwrap();
+
+        Gateway::new_with_custom_registry(
+            // Fixtures does not use real lightning connection, so just fake the connection
+            // parameters
+            LightningMode::Lnd {
+                lnd_rpc_addr: "FakeRpcAddr".to_string(),
+                lnd_tls_cert: "FakeTlsCert".to_string(),
+                lnd_macaroon: "FakeMacaroon".to_string(),
+            },
+            client_builder,
+            listen,
+            address.clone(),
+            bcrypt::HashParts::from_str(
+                &bcrypt::hash(DEFAULT_GATEWAY_PASSWORD, bcrypt::DEFAULT_COST).unwrap(),
+            )
+            .unwrap(),
+            bitcoin::Network::Regtest,
+            0,
+            gateway_db,
+            // Manually set the gateway's state to `Running`. In tests, we do don't run the
+            // webserver or intercept HTLCs, so this is necessary for instructing the
+            // gateway that it is connected to the mock Lightning node.
+            fedimint_gateway_server::GatewayState::Running { lightning_context },
+            lightning_module_mode,
         )
         .await
-    }
-
-    /// Returns the LND lightning node
-    pub async fn lnd(&self) -> Arc<dyn LightningTest> {
-        match Fixtures::is_real_test() {
-            true => Arc::new(LndLightningTest::new().await),
-            false => Arc::new(FakeLightningTest::new()),
-        }
-    }
-
-    /// Returns the CLN lightning node
-    pub async fn cln(&self) -> Arc<dyn LightningTest> {
-        match Fixtures::is_real_test() {
-            true => {
-                let dir = env::var("FM_TEST_DIR").expect("Real tests require FM_TEST_DIR");
-                Arc::new(ClnLightningTest::new(&dir).await)
-            }
-            false => Arc::new(FakeLightningTest::new()),
-        }
+        .expect("Failed to create gateway")
     }
 
     /// Get a server bitcoin RPC config
@@ -174,12 +243,17 @@ impl Fixtures {
     // TODO: Right now we only support mocks or esplora, we should support others in
     // the future
     pub fn bitcoin_client(&self) -> BitcoinRpcConfig {
-        match Fixtures::is_real_test() {
-            true => BitcoinRpcConfig {
+        if Fixtures::is_real_test() {
+            BitcoinRpcConfig {
                 kind: "esplora".to_string(),
-                url: "http://127.0.0.1:50002".parse().unwrap(),
-            },
-            false => self.bitcoin_rpc.clone(),
+                url: SafeUrl::parse(&format!(
+                    "http://127.0.0.1:{}/",
+                    env::var(FM_PORT_ESPLORA_ENV).unwrap_or(String::from("50002"))
+                ))
+                .expect("Failed to parse default esplora server"),
+            }
+        } else {
+            self.bitcoin_rpc.clone()
         }
     }
 
@@ -187,22 +261,8 @@ impl Fixtures {
     pub fn bitcoin(&self) -> Arc<dyn BitcoinTest> {
         self.bitcoin.clone()
     }
-}
 
-/// If `FM_TEST_DIR` is set, use it as a base, otherwise use a tempdir
-///
-/// Callers must hold onto the tempdir until it is no longer needed
-pub fn test_dir(pathname: &str) -> (PathBuf, Option<TempDir>) {
-    let (parent, maybe_tmp_dir_guard) = match env::var("FM_TEST_DIR") {
-        Ok(directory) => (directory, None),
-        Err(_) => {
-            let random = format!("test-{}", rand::random::<u64>());
-            let guard = tempfile::Builder::new().prefix(&random).tempdir().unwrap();
-            let directory = guard.path().to_str().unwrap().to_owned();
-            (directory, Some(guard))
-        }
-    };
-    let fullpath = PathBuf::from(parent).join(pathname);
-    fs::create_dir_all(fullpath.clone()).expect("Can make dirs");
-    (fullpath, maybe_tmp_dir_guard)
+    pub fn dyn_bitcoin_rpc(&self) -> DynBitcoindRpc {
+        self.dyn_bitcoin_rpc.clone()
+    }
 }

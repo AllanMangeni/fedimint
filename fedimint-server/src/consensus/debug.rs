@@ -1,44 +1,100 @@
-use std::fmt::Write;
+use std::fmt;
 
-use fedimint_core::transaction::Transaction;
+use bitcoin::hashes::{Hash as _, sha256};
+use fedimint_core::encoding::{CountWrite, Encodable as _};
+use fedimint_core::session_outcome::AcceptedItem;
 
-use crate::{ConsensusItem, HbbftConsensusOutcome};
+use crate::ConsensusItem;
 
-/// outputs a useful debug message for epochs indicating what happened
-pub fn epoch_message(consensus: &HbbftConsensusOutcome) -> String {
-    let peers = consensus.contributions.keys();
-    let mut debug = format!("\n- Epoch: {} {:?} -", consensus.epoch, peers);
+/// A newtype for a nice [`fmt::Debug`] of a [`ConsensusItem`]
+pub struct DebugConsensusItem<'ci>(pub &'ci ConsensusItem);
 
-    for (peer, items) in consensus.contributions.iter() {
-        for item in items {
-            let item_debug = item_message(item);
-            write!(debug, "\n  Peer {peer}: {item_debug}").unwrap();
+impl<'ci> fmt::Debug for DebugConsensusItem<'ci> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ConsensusItem::Module(mci) => {
+                f.write_fmt(format_args!(
+                    "Module CI: module={} ci={}",
+                    mci.module_instance_id(),
+                    mci
+                ))?;
+            }
+            ConsensusItem::Transaction(tx) => {
+                f.write_fmt(format_args!(
+                    "Transaction txid={}, inputs_num={}, outputs_num={}",
+                    tx.tx_hash(),
+                    tx.inputs.len(),
+                    tx.outputs.len(),
+                ))?;
+                // TODO: This is kind of lengthy, and maybe could be conditionally enabled
+                // via an env var or something.
+                for input in &tx.inputs {
+                    // TODO: add pretty print fn to interface
+                    f.write_fmt(format_args!("\n    Input: {input}"))?;
+                }
+                for output in &tx.outputs {
+                    f.write_fmt(format_args!("\n    Output: {output}")).unwrap();
+                }
+            }
+            ConsensusItem::Default { variant, .. } => {
+                f.write_fmt(format_args!("Unknown CI variant: {variant}"))?;
+            }
         }
+        Ok(())
     }
-    debug
 }
 
-fn item_message(item: &ConsensusItem) -> String {
-    match item {
-        ConsensusItem::EpochOutcomeSignatureShare(_) => "Outcome Signature".to_string(),
-        ConsensusItem::ClientConfigSignatureShare(_) => "Client Config Signature".to_string(),
-        // TODO: make this nice again
-        ConsensusItem::Module(mci) => {
-            format!("Module CI: module={} ci={}", mci.module_instance_id(), mci)
-        }
-        ConsensusItem::Transaction(Transaction {
-            inputs, outputs, ..
-        }) => {
-            let mut tx_debug = "Transaction".to_string();
-            for input in inputs.iter() {
-                // TODO: add pretty print fn to interface
-                write!(tx_debug, "\n    Input: {input}").unwrap();
+/// A compact citem formatter, useful for debugging in case of consensus failure
+///
+/// Unlike [`DebugConsensusItem`], this one is used when a (potentially) long
+/// list of citems are dumped, so it needs to be very compact.
+pub struct DebugConsensusItemCompact<'a>(pub &'a AcceptedItem);
+
+impl<'a> fmt::Display for DebugConsensusItemCompact<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut engine = sha256::HashEngine::default();
+        let mut count = CountWrite::from(&mut engine);
+        self.0
+            .consensus_encode(&mut count)
+            .map_err(|_| fmt::Error)?;
+
+        let count = count.count();
+        let hash = *sha256::Hash::from_engine(engine).as_byte_array();
+        f.write_fmt(format_args!(
+            "{}; peer={}; len={count}; ",
+            hex::encode(&hash[0..12]),
+            self.0.peer,
+        ))?;
+
+        match &self.0.item {
+            ConsensusItem::Transaction(tx) => {
+                f.write_fmt(format_args!("txid={}; ", tx.tx_hash()))?;
+                f.write_str("inputs_module_ids=")?;
+                for (i, input) in tx.inputs.iter().enumerate() {
+                    if i != 0 {
+                        f.write_str(",")?;
+                    }
+                    f.write_fmt(format_args!("{}", input.module_instance_id()))?;
+                }
+                f.write_str("; outputs_module_ids=")?;
+                for (i, output) in tx.outputs.iter().enumerate() {
+                    if i != 0 {
+                        f.write_str(",")?;
+                    }
+                    f.write_fmt(format_args!("{}", output.module_instance_id()))?;
+                }
             }
-            for output in outputs.iter() {
-                write!(tx_debug, "\n    Output: {output}").unwrap();
+            ConsensusItem::Module(module_citem) => {
+                f.write_fmt(format_args!(
+                    "citem={}; ",
+                    module_citem.module_instance_id()
+                ))?;
             }
-            tx_debug
+            ConsensusItem::Default { variant, .. } => {
+                f.write_fmt(format_args!("unknown variant={variant}"))?;
+            }
         }
-        ConsensusItem::ConsensusUpgrade(_) => "Consensus Upgrade".to_string(),
+
+        Ok(())
     }
 }

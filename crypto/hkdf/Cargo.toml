@@ -1,15 +1,16 @@
 [package]
-name = "hkdf"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+name = "fedimint-hkdf"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "RFC5869 HKDF implementation on top of bitcoin_hashes"
-license = "MIT"
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "hkdf"
 path = "src/lib.rs"
 
 [dependencies]
-bitcoin_hashes = "0.11.0"
+bitcoin_hashes = { workspace = true }

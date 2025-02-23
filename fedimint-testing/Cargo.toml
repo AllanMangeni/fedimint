@@ -1,44 +1,48 @@
 [package]
 name = "fedimint-testing"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "fedimint-testing provides a library of shared objects and utilities for testing fedimint components"
-license = "MIT"
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[features]
+tor = ["fedimint-gateway-server/tor", "fedimint-gateway-common/tor"]
+
 [lib]
 name = "fedimint_testing"
 path = "src/lib.rs"
 
-
 [dependencies]
-anyhow = "1.0.65"
-async-trait = "*"
-bitcoin = "0.29.2"
-bitcoincore-rpc = "0.16.0"
-clap = { version = "4.1.6", features = ["derive", "std", "help", "usage", "error-context", "suggestions" ], default-features = false }
-cln-rpc = "0.1.1"
-fedimint-core  = { path = "../fedimint-core" }
-fedimint-client  = { path = "../fedimint-client" }
-fedimint-server  = { path = "../fedimint-server" }
-fedimint-bitcoind = { path = "../fedimint-bitcoind" }
-fedimint-logging = { path = "../fedimint-logging" }
-fedimint-rocksdb = { path = "../fedimint-rocksdb" }
-lazy_static = "1.4.0"
-ln-gateway = { path = "../gateway/ln-gateway" }
-futures = "0.3"
-lightning = "0.0.113"
-lightning-invoice = "0.21.0"
-tempfile = "3.4.0"
-secp256k1-zkp = { version = "0.7.0", features = [ "global-context", "bitcoin_hashes" ] }
-serde = { version = "1.0.149", features = [ "derive" ] }
-tracing ="0.1.37"
-rand = "0.8"
-tokio-rustls = "0.23.4"
-tokio = { version = "1.26.0", features = ["full"] }
-tokio-stream = "0.1.11"
-tonic_lnd = { git = "https://github.com/fedimint/tonic_lnd", branch="lnd-client-features", features = ["lightningrpc", "routerrpc"] }
-url = "2.3.1"
-# Remove once we modularize the gw
-fedimint-client-legacy = { path = "../fedimint-client-legacy" }
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+bcrypt = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-bitcoind = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-gateway-common = { workspace = true }
+fedimint-gateway-server = { package = "fedimint-gateway-server", path = "../gateway/fedimint-gateway-server", version = "=0.7.0-alpha" }
+fedimint-lightning = { package = "fedimint-lightning", path = "../gateway/fedimint-lightning", version = "=0.7.0-alpha" }
+fedimint-ln-common = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-portalloc = { workspace = true }
+fedimint-rocksdb = { workspace = true }
+fedimint-server = { workspace = true }
+fedimint-testing-core = { workspace = true }
+fs-lock = { workspace = true }
+lightning-invoice = { workspace = true }
+rand = { workspace = true }
+tempfile = "3.16.0"
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }

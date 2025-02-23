@@ -1,51 +1,57 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
-use std::vec;
 
-use anyhow::{bail, Context, Result};
-use bitcoin::secp256k1;
+use anyhow::{Context, Result, anyhow, bail};
 use devimint::cmd;
-use fedimint_client::secret::PlainRootSecretStrategy;
-use fedimint_client::sm::OperationId;
+use devimint::util::{ClnLightningCli, FedimintCli, LnCli};
+use fedimint_client::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_client::transaction::TransactionBuilder;
-use fedimint_client::{Client, ClientBuilder};
-use fedimint_core::config::ClientConfig;
-use fedimint_core::core::IntoDynInstance;
-use fedimint_core::encoding::Decodable;
-use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::module::CommonModuleGen;
-use fedimint_core::task::TaskGroup;
-use fedimint_core::{Amount, OutPoint, TieredMulti, TieredSummary};
-use fedimint_ln_client::{LightningClientExt, LightningClientGen, LnPayState};
-use fedimint_mint_client::{
-    MintClientExt, MintClientGen, MintClientModule, MintCommonGen, SpendableNote,
+use fedimint_client::{Client, ClientHandleArc};
+use fedimint_core::core::{IntoDynInstance, OperationId};
+use fedimint_core::db::Database;
+use fedimint_core::invite_code::InviteCode;
+use fedimint_core::module::CommonModuleInit;
+use fedimint_core::module::registry::ModuleRegistry;
+use fedimint_core::{Amount, OutPoint, PeerId, TieredCounts, secp256k1};
+use fedimint_ln_client::{
+    LightningClientInit, LightningClientModule, LnPayState, OutgoingLightningPayment,
 };
-use fedimint_wallet_client::WalletClientGen;
+use fedimint_ln_common::LightningGateway;
+use fedimint_mint_client::{
+    MintClientInit, MintClientModule, MintCommonInit, OOBNotes, SelectNotesWithAtleastAmount,
+};
+use fedimint_wallet_client::WalletClientInit;
 use futures::StreamExt;
-use lightning_invoice::Invoice;
+use lightning_invoice::Bolt11Invoice;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::MetricEvent;
 
-pub async fn get_notes_cli(amount: &Amount) -> anyhow::Result<TieredMulti<SpendableNote>> {
+pub async fn get_invite_code_cli(peer: PeerId) -> anyhow::Result<InviteCode> {
+    cmd!(FedimintCli, "invite-code", peer).out_json().await?["invite_code"]
+        .as_str()
+        .map(InviteCode::from_str)
+        .transpose()?
+        .context("missing invite code")
+}
+
+pub async fn get_notes_cli(amount: &Amount) -> anyhow::Result<OOBNotes> {
     cmd!(FedimintCli, "spend", amount.msats.to_string())
         .out_json()
         .await?["notes"]
         .as_str()
-        .map(parse_ecash)
+        .map(OOBNotes::from_str)
         .transpose()?
         .context("missing notes output")
 }
 
-pub async fn try_get_notes_cli(
-    amount: &Amount,
-    tries: usize,
-) -> anyhow::Result<TieredMulti<SpendableNote>> {
+pub async fn try_get_notes_cli(amount: &Amount, tries: usize) -> anyhow::Result<OOBNotes> {
     for _ in 0..tries {
         match get_notes_cli(amount).await {
-            Ok(notes) => return Ok(notes),
+            Ok(oob_notes) => return Ok(oob_notes),
             Err(e) => {
                 info!("Failed to get notes from cli: {e}, trying again after a second...");
                 fedimint_core::task::sleep(Duration::from_secs(1)).await;
@@ -56,19 +62,20 @@ pub async fn try_get_notes_cli(
 }
 
 pub async fn reissue_notes(
-    client: &Client,
-    notes: TieredMulti<SpendableNote>,
+    client: &ClientHandleArc,
+    oob_notes: OOBNotes,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
     let m = fedimint_core::time::now();
-    let operation_id = client.reissue_external_notes(notes, ()).await?;
-    let mut updates = client
+    let mint = &client.get_first_module::<MintClientModule>()?;
+    let operation_id = mint.reissue_external_notes(oob_notes, ()).await?;
+    let mut updates = mint
         .subscribe_reissue_external_notes(operation_id)
         .await?
         .into_stream();
     while let Some(update) = updates.next().await {
         if let fedimint_mint_client::ReissueExternalNotesState::Failed(e) = update {
-            return Err(anyhow::Error::msg(format!("Reissue failed: {e}")));
+            bail!("Reissue failed: {e}")
         }
     }
     event_sender.send(MetricEvent {
@@ -79,13 +86,20 @@ pub async fn reissue_notes(
 }
 
 pub async fn do_spend_notes(
-    client: &Client,
+    mint: &ClientHandleArc,
     amount: Amount,
-) -> anyhow::Result<(OperationId, TieredMulti<SpendableNote>)> {
-    let (operation_id, notes) = client
-        .spend_notes(amount, Duration::from_secs(600), ())
+) -> anyhow::Result<(OperationId, OOBNotes)> {
+    let mint = &mint.get_first_module::<MintClientModule>()?;
+    let (operation_id, oob_notes) = mint
+        .spend_notes_with_selector(
+            &SelectNotesWithAtleastAmount,
+            amount,
+            Duration::from_secs(600),
+            false,
+            (),
+        )
         .await?;
-    let mut updates = client
+    let mut updates = mint
         .subscribe_spend_notes(operation_id)
         .await?
         .into_stream();
@@ -94,18 +108,19 @@ pub async fn do_spend_notes(
             fedimint_mint_client::SpendOOBState::Created
             | fedimint_mint_client::SpendOOBState::Success => {}
             other => {
-                return Err(anyhow::Error::msg(format!("Spend failed: {other:?}")));
+                bail!("Spend failed: {other:?}");
             }
         }
     }
-    Ok((operation_id, notes))
+    Ok((operation_id, oob_notes))
 }
 
 pub async fn await_spend_notes_finish(
-    client: &Client,
+    client: &ClientHandleArc,
     operation_id: OperationId,
 ) -> anyhow::Result<()> {
     let mut updates = client
+        .get_first_module::<MintClientModule>()?
         .subscribe_spend_notes(operation_id)
         .await?
         .into_stream();
@@ -115,7 +130,7 @@ pub async fn await_spend_notes_finish(
             fedimint_mint_client::SpendOOBState::Created
             | fedimint_mint_client::SpendOOBState::Success => {}
             other => {
-                return Err(anyhow::Error::msg(format!("Spend failed: {other:?}")));
+                bail!("Spend failed: {other:?}");
             }
         }
     }
@@ -123,40 +138,48 @@ pub async fn await_spend_notes_finish(
 }
 
 pub async fn build_client(
-    cfg: &ClientConfig,
-    tg: &mut TaskGroup,
+    invite_code: Option<InviteCode>,
     rocksdb: Option<&PathBuf>,
-) -> anyhow::Result<Client> {
-    let mut client_builder = ClientBuilder::default();
-    client_builder.with_module(MintClientGen);
-    client_builder.with_module(LightningClientGen);
-    client_builder.with_module(WalletClientGen::default());
-    client_builder.with_primary_module(1);
-    client_builder.with_config(cfg.clone());
-    if let Some(rocksdb) = rocksdb {
-        client_builder.with_database(fedimint_rocksdb::RocksDb::open(rocksdb)?)
+) -> anyhow::Result<(ClientHandleArc, Option<InviteCode>)> {
+    let db = if let Some(rocksdb) = rocksdb {
+        Database::new(
+            fedimint_rocksdb::RocksDb::open(rocksdb)?,
+            ModuleRegistry::default(),
+        )
     } else {
-        client_builder.with_database(fedimint_core::db::mem_impl::MemDatabase::new())
-    }
-    let client = client_builder.build::<PlainRootSecretStrategy>(tg).await?;
-    Ok(client)
+        fedimint_core::db::mem_impl::MemDatabase::new().into()
+    };
+    let mut client_builder = Client::builder(db).await?;
+    client_builder.with_module(MintClientInit);
+    client_builder.with_module(LightningClientInit::default());
+    client_builder.with_module(WalletClientInit::default());
+    client_builder.with_primary_module_kind(fedimint_mint_client::KIND);
+    let client_secret =
+        Client::load_or_generate_client_secret(client_builder.db_no_decoders()).await?;
+    let root_secret = PlainRootSecretStrategy::to_root_secret(&client_secret);
+
+    let client = if Client::is_initialized(client_builder.db_no_decoders()).await {
+        client_builder.open(root_secret).await
+    } else if let Some(invite_code) = &invite_code {
+        let client_config = fedimint_api_client::api::net::Connector::default()
+            .download_from_invite_code(invite_code)
+            .await?;
+        client_builder
+            .join(root_secret, client_config.clone(), invite_code.api_secret())
+            .await
+    } else {
+        bail!("Database not initialize and invite code not provided");
+    }?;
+    Ok((Arc::new(client), invite_code))
 }
 
-pub fn parse_ecash(s: &str) -> anyhow::Result<TieredMulti<SpendableNote>> {
-    let bytes = base64::decode(s)?;
-    Ok(Decodable::consensus_decode(
-        &mut std::io::Cursor::new(bytes),
-        &ModuleDecoderRegistry::default(),
-    )?)
-}
-
-pub async fn lnd_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, String)> {
+pub async fn lnd_create_invoice(amount: Amount) -> anyhow::Result<(Bolt11Invoice, String)> {
     let result = cmd!(LnCli, "addinvoice", "--amt_msat", amount.msats)
         .out_json()
         .await?;
     let invoice = result["payment_request"]
         .as_str()
-        .map(Invoice::from_str)
+        .map(Bolt11Invoice::from_str)
         .transpose()?
         .context("Missing payment_request field")?;
     let r_hash = result["r_hash"]
@@ -166,49 +189,111 @@ pub async fn lnd_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, Stri
     Ok((invoice, r_hash))
 }
 
+pub async fn lnd_pay_invoice(invoice: Bolt11Invoice) -> anyhow::Result<()> {
+    let status = cmd!(
+        LnCli,
+        "payinvoice",
+        "--force",
+        "--allow_self_payment",
+        "--json",
+        invoice.to_string()
+    )
+    .out_json()
+    .await?["status"]
+        .as_str()
+        .context("Missing status field")?
+        .to_owned();
+    anyhow::ensure!(status == "SUCCEEDED");
+    Ok(())
+}
+
 pub async fn lnd_wait_invoice_payment(r_hash: String) -> anyhow::Result<()> {
     for _ in 0..60 {
         let result = cmd!(LnCli, "lookupinvoice", &r_hash).out_json().await?;
         let state = result["state"].as_str().context("Missing state field")?;
         if state == "SETTLED" {
             return Ok(());
-        } else {
-            fedimint_core::task::sleep(Duration::from_millis(500)).await;
         }
+
+        fedimint_core::task::sleep(Duration::from_millis(500)).await;
     }
     anyhow::bail!("Timeout waiting for invoice to settle: {r_hash}")
 }
 
 pub async fn gateway_pay_invoice(
-    client: &Client,
-    invoice: Invoice,
+    prefix: &str,
+    gateway_name: &str,
+    client: &ClientHandleArc,
+    invoice: Bolt11Invoice,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
+    ln_gateway: Option<LightningGateway>,
 ) -> anyhow::Result<()> {
     let m = fedimint_core::time::now();
-    let (pay_type, _) = client.pay_bolt11_invoice(invoice).await?;
-    let operation_id = match pay_type {
+    let lightning_module = &client.get_first_module::<LightningClientModule>()?;
+    let OutgoingLightningPayment {
+        payment_type,
+        contract_id: _,
+        fee: _,
+    } = lightning_module
+        .pay_bolt11_invoice(ln_gateway, invoice, ())
+        .await?;
+    let operation_id = match payment_type {
         fedimint_ln_client::PayType::Internal(_) => bail!("Internal payment not expected"),
         fedimint_ln_client::PayType::Lightning(operation_id) => operation_id,
     };
-    let mut updates = client.subscribe_ln_pay(operation_id).await?.into_stream();
+    let mut updates = lightning_module
+        .subscribe_ln_pay(operation_id)
+        .await?
+        .into_stream();
     while let Some(update) = updates.next().await {
-        info!("LnPayState update: {update:?}");
+        info!("{prefix} LnPayState update: {update:?}");
         match update {
             LnPayState::Success { preimage: _ } => {
+                let elapsed: Duration = m.elapsed()?;
+                info!("{prefix} Invoice paid in {elapsed:?}");
+                event_sender.send(MetricEvent {
+                    name: "gateway_pay_invoice_success".into(),
+                    duration: elapsed,
+                })?;
+                event_sender.send(MetricEvent {
+                    name: format!("gateway_{gateway_name}_pay_invoice_success"),
+                    duration: elapsed,
+                })?;
                 break;
             }
-            LnPayState::Created | LnPayState::Funded | LnPayState::AwaitingChange => {}
-            other => bail!("Failed to pay invoice: {other:?}"),
+            LnPayState::Created
+            | LnPayState::Funded { block_height: _ }
+            | LnPayState::AwaitingChange => {}
+            LnPayState::Canceled => {
+                let elapsed: Duration = m.elapsed()?;
+                warn!("{prefix} Invoice canceled in {elapsed:?}");
+                event_sender.send(MetricEvent {
+                    name: "gateway_pay_invoice_canceled".into(),
+                    duration: elapsed,
+                })?;
+                break;
+            }
+            LnPayState::Refunded { gateway_error } => {
+                let elapsed: Duration = m.elapsed()?;
+                warn!("{prefix} Invoice refunded due to {gateway_error} in {elapsed:?}");
+                event_sender.send(MetricEvent {
+                    name: "gateway_pay_invoice_refunded".into(),
+                    duration: elapsed,
+                })?;
+                break;
+            }
+            LnPayState::WaitingForRefund { error_reason } => {
+                warn!("{prefix} Waiting for refund: {error_reason:?}");
+            }
+            LnPayState::UnexpectedError { error_message } => {
+                bail!("Failed to pay invoice: {error_message:?}")
+            }
         }
     }
-    event_sender.send(MetricEvent {
-        name: "gateway_pay_invoice".into(),
-        duration: m.elapsed()?,
-    })?;
     Ok(())
 }
 
-pub async fn cln_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, String)> {
+pub async fn cln_create_invoice(amount: Amount) -> anyhow::Result<(Bolt11Invoice, String)> {
     let now = fedimint_core::time::now();
     let random_n: u128 = rand::random();
     let label = format!("label-{now:?}-{random_n}");
@@ -218,7 +303,18 @@ pub async fn cln_create_invoice(amount: Amount) -> anyhow::Result<(Invoice, Stri
         .as_str()
         .context("Missing bolt11 field")?
         .to_owned();
-    Ok((Invoice::from_str(&invoice_string)?, label))
+    Ok((Bolt11Invoice::from_str(&invoice_string)?, label))
+}
+
+pub async fn cln_pay_invoice(invoice: Bolt11Invoice) -> anyhow::Result<()> {
+    let status = cmd!(ClnLightningCli, "pay", invoice.to_string())
+        .out_json()
+        .await?["status"]
+        .as_str()
+        .context("Missing status field")?
+        .to_owned();
+    anyhow::ensure!(status == "complete");
+    Ok(())
 }
 
 pub async fn cln_wait_invoice_payment(label: &str) -> anyhow::Result<()> {
@@ -235,113 +331,73 @@ pub async fn cln_wait_invoice_payment(label: &str) -> anyhow::Result<()> {
     }
 }
 
-pub async fn switch_default_gateway(
-    client: &Client,
-    gateway_public_key: &str,
-) -> anyhow::Result<()> {
-    let gateway_public_key = parse_gateway_pub_key(gateway_public_key)?;
-    client.set_active_gateway(&gateway_public_key).await?;
-    Ok(())
+pub fn parse_gateway_id(s: &str) -> Result<secp256k1::PublicKey, secp256k1::Error> {
+    secp256k1::PublicKey::from_str(s)
 }
 
-pub fn parse_gateway_pub_key(s: &str) -> Result<secp256k1::XOnlyPublicKey, secp256k1::Error> {
-    secp256k1::XOnlyPublicKey::from_str(s)
-}
-
-pub async fn get_note_summary(client: &Client) -> anyhow::Result<TieredSummary> {
-    let (mint_client, _) = client.get_first_module::<MintClientModule>(&fedimint_mint_client::KIND);
+pub async fn get_note_summary(client: &ClientHandleArc) -> anyhow::Result<TieredCounts> {
+    let mint_client = client.get_first_module::<MintClientModule>()?;
     let summary = mint_client
-        .get_wallet_summary(&mut client.db().begin_transaction().await.with_module_prefix(1))
+        .get_note_counts_by_denomination(
+            &mut client
+                .db()
+                .begin_transaction_nc()
+                .await
+                .to_ref_with_prefix_module_id(1)
+                .0,
+        )
         .await;
     Ok(summary)
 }
 
 pub async fn remint_denomination(
-    client: &Client,
+    client: &ClientHandleArc,
     denomination: Amount,
     quantity: u16,
 ) -> anyhow::Result<()> {
-    let (mint_client, client_module_instance) =
-        client.get_first_module::<MintClientModule>(&fedimint_mint_client::KIND);
+    let mint_client = client.get_first_module::<MintClientModule>()?;
     let mut dbtx = client.db().begin_transaction().await;
-    let mut module_transaction = dbtx.with_module_prefix(client_module_instance.id);
+    let mut module_transaction = dbtx.to_ref_with_prefix_module_id(mint_client.id).0;
     let mut tx = TransactionBuilder::new();
     let operation_id = OperationId::new_random();
     for _ in 0..quantity {
-        let output = mint_client
-            .create_output(&mut module_transaction, operation_id, 1, denomination)
-            .await;
-        tx = tx.with_output(output.into_dyn(client_module_instance.id));
+        let outputs = mint_client
+            .create_output(
+                &mut module_transaction.to_ref_nc(),
+                operation_id,
+                1,
+                denomination,
+            )
+            .await
+            .into_dyn(mint_client.id);
+
+        tx = tx.with_outputs(outputs);
     }
     drop(module_transaction);
-    let operation_meta_gen = |_txid, _outpoint| ();
+    let operation_meta_gen = |_| ();
     let txid = client
         .finalize_and_submit_transaction(
             operation_id,
-            MintCommonGen::KIND.as_str(),
+            MintCommonInit::KIND.as_str(),
             operation_meta_gen,
             tx,
         )
-        .await?;
+        .await?
+        .txid();
     let tx_subscription = client.transaction_updates(operation_id).await;
-    tx_subscription.await_tx_accepted(txid).await?;
+    tx_subscription
+        .await_tx_accepted(txid)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
     dbtx.commit_tx().await;
     for i in 0..quantity {
         let out_point = OutPoint {
             txid,
-            out_idx: i as u64,
+            out_idx: u64::from(i),
         };
         mint_client
             .await_output_finalized(operation_id, out_point)
             .await?;
     }
     Ok(())
-}
-
-fn get_command_for_alias(alias: &str, default: &str) -> devimint::util::Command {
-    // try to use alias if set
-    let cli = std::env::var(alias)
-        .map(|s| s.split_whitespace().map(ToOwned::to_owned).collect())
-        .unwrap_or_else(|_| vec![default.into()]);
-    let mut cmd = tokio::process::Command::new(&cli[0]);
-    cmd.args(&cli[1..]);
-    devimint::util::Command {
-        cmd,
-        args_debug: cli,
-    }
-}
-
-pub struct FedimintCli;
-impl FedimintCli {
-    pub async fn cmd(self) -> devimint::util::Command {
-        get_command_for_alias("FM_MINT_CLIENT", "fedimint-cli")
-    }
-}
-
-pub struct LnCli;
-impl LnCli {
-    pub async fn cmd(self) -> devimint::util::Command {
-        get_command_for_alias("FM_LNCLI", "lncli")
-    }
-}
-
-pub struct ClnLightningCli;
-impl ClnLightningCli {
-    pub async fn cmd(self) -> devimint::util::Command {
-        get_command_for_alias("FM_LIGHTNING_CLI", "lightning-cli")
-    }
-}
-
-pub struct GatewayClnCli;
-impl GatewayClnCli {
-    pub async fn cmd(self) -> devimint::util::Command {
-        get_command_for_alias("FM_GWCLI_CLN", "gateway-cln")
-    }
-}
-
-pub struct GatewayLndCli;
-impl GatewayLndCli {
-    pub async fn cmd(self) -> devimint::util::Command {
-        get_command_for_alias("FM_GWCLI_LND", "gateway-lnd")
-    }
 }

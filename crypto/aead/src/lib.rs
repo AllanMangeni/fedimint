@@ -1,18 +1,22 @@
+pub mod envs;
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{bail, format_err, Result};
+use anyhow::{Result, bail, format_err};
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, Params};
-use rand::rngs::OsRng;
 use rand::Rng;
+use rand::rngs::OsRng;
 use ring::aead::Nonce;
-pub use ring::aead::{Aad, LessSafeKey, UnboundKey, NONCE_LEN};
+pub use ring::aead::{Aad, LessSafeKey, NONCE_LEN, UnboundKey};
+
+use crate::envs::FM_TEST_FAST_WEAK_CRYPTO_ENV;
 
 /// Get a random nonce.
 pub fn get_random_nonce() -> ring::aead::Nonce {
-    Nonce::assume_unique_for_key(OsRng.gen())
+    Nonce::assume_unique_for_key(OsRng.r#gen())
 }
 
 /// Encrypt `plaintext` using `key`.
@@ -107,7 +111,7 @@ pub fn random_salt() -> String {
 /// for testing
 fn argon2() -> Argon2<'static> {
     let mut params = argon2::ParamsBuilder::default();
-    if let Ok("1") = std::env::var("FM_TEST_FAST_WEAK_CRYPTO").as_deref() {
+    if let Ok("1") = std::env::var(FM_TEST_FAST_WEAK_CRYPTO_ENV).as_deref() {
         params.m_cost(Params::MIN_M_COST);
     }
     Argon2::from(params.build().expect("valid params"))

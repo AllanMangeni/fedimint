@@ -1,41 +1,52 @@
 [package]
 name = "fedimint-client"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
-description = "fedimint-client provides a library for sending transactions to the federation. It replaces fedimint-client-legacy."
-license = "MIT"
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+readme = { workspace = true }
+description = "Library for sending transactions to the Fedimint federation."
 
 [package.metadata.cargo-udeps.ignore]
 # cargo udeps can't detect that one
 normal = ["aquamarine"]
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[features]
+tor = ["fedimint-client-module/tor"]
 
 [lib]
 name = "fedimint_client"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.69"
-aquamarine = "0.3.1"
-async-stream = "0.3.5"
-async-trait = "0.1.66"
-bitcoin = "0.29.2"
-bitcoin_hashes = "0.11.0"
-fedimint-core  = { path = "../fedimint-core/" }
-fedimint-derive-secret = { path = "../crypto/derive-secret" }
-fedimint-aead = { path = "../crypto/aead" }
-fedimint-logging = { path = "../fedimint-logging" }
-futures = "0.3.26"
-itertools = "0.10.5"
-rand = "0.8.5"
-secp256k1-zkp = "0.7.0"
-serde = "1.0.152"
-serde_json = "1.0.91"
-strum = "0.24.1"
-strum_macros = "0.24.1"
-thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = [ "time", "macros" ] }
-tracing = "0.1.37"
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true, features = ["rand-std"] }
+fedimint-aead = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-derive-secret = { workspace = true }
+fedimint-eventlog = { workspace = true }
+fedimint-logging = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tracing-test = "0.2.4"
+tracing-test = { workspace = true }
+
+[build-dependencies]
+fedimint-build = { workspace = true }

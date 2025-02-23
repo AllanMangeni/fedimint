@@ -1,27 +1,42 @@
 [package]
 name = "fedimint-mint-tests"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "fedimint-mint-tests contains integration tests for the mint module"
-license = "MIT"
+license = { workspace = true }
+publish = false
 
 [[test]]
 name = "fedimint_mint_tests"
 path = "tests/tests.rs"
 
 [dependencies]
-anyhow = "1.0.66"
-fedimint-dummy-common = { path = "../fedimint-dummy-common" }
-fedimint-dummy-client = { path = "../fedimint-dummy-client" }
-fedimint-dummy-server = { path = "../fedimint-dummy-server" }
-fedimint-mint-common = { path = "../fedimint-mint-common" }
-fedimint-mint-client = { path = "../fedimint-mint-client" }
-fedimint-mint-server = { path = "../fedimint-mint-server" }
-fedimint-testing = { path = "../../fedimint-testing" }
-fedimint-client = { path = "../../fedimint-client" }
-fedimint-core ={ path = "../../fedimint-core" }
-fedimint-server = { path = "../../fedimint-server" }
-fedimint-logging = { path = "../../fedimint-logging" }
-tokio = { version = "1.26.0", features = ["sync"] }
-tracing = "0.1.37"
+anyhow = { workspace = true }
+bitcoin_hashes = { workspace = true }
+bls12_381 = { workspace = true }
+devimint = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-derive-secret = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-mint-client = { workspace = true }
+fedimint-mint-common = { workspace = true }
+fedimint-mint-server = { workspace = true }
+fedimint-server = { workspace = true }
+fedimint-testing = { workspace = true }
+ff = "0.13.0"
+futures = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+strum = { workspace = true }
+tbs = { workspace = true }
+threshold_crypto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+fedimint-dummy-client = { workspace = true }
+fedimint-dummy-common = { workspace = true }
+fedimint-dummy-server = { workspace = true }

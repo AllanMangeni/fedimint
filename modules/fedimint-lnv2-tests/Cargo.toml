@@ -1,0 +1,39 @@
+[package]
+name = "fedimint-lnv2-tests"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+description = "fedimint-lnv2-tests contains integration tests for the lnv2 module"
+license = { workspace = true }
+publish = false
+
+[[bin]]
+name = "fedimint-lnv2-devimint-tests"
+path = "bin/tests.rs"
+
+[[test]]
+name = "fedimint_lnv2_tests"
+path = "tests/tests.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+devimint = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-dummy-client = { workspace = true }
+fedimint-dummy-common = { workspace = true }
+fedimint-dummy-server = { workspace = true }
+fedimint-ln-common = { workspace = true }
+fedimint-lnv2-client = { workspace = true }
+fedimint-lnv2-common = { workspace = true }
+fedimint-lnv2-server = { workspace = true }
+fedimint-testing = { workspace = true }
+itertools = { workspace = true }
+lightning-invoice = { workspace = true }
+serde_json = { workspace = true }
+substring = "1.4.5"
+tokio = { workspace = true }
+tracing = { workspace = true }

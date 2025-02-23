@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::time;
 
 use fedimint_logging::LOG_TIMING;
-use tracing::{debug, info, trace, warn, Level};
+use tracing::{Level, debug, info, trace, warn};
+
+use crate::util::FmtCompact as _;
 
 /// Data inside `TimeReporter`, in another struct to be able to move it out of
 /// without violating `drop` consistency
@@ -14,16 +16,15 @@ struct TimeReporterInner {
 }
 
 impl TimeReporterInner {
-    fn report(&mut self) {
+    fn report(&self) {
         let duration = crate::time::now()
             .duration_since(self.start)
-            .map_err(|error| {
+            .inspect_err(|error| {
                 warn!(
                     target: LOG_TIMING,
-                    %error,
+                    err = %error.fmt_compact(),
                     "Timer reporter duration overflow. This should not happen."
                 );
-                error
             })
             .unwrap_or_default();
 
@@ -72,7 +73,7 @@ impl TimeReporterInner {
                     name = %self.name,
                     duration_ms = duration.as_millis(),
                     threshold_ms = threshold.as_millis(),
-                    "Operation time exeeded threshold"
+                    "Operation time exceeded threshold"
                 );
             }
         }
@@ -87,11 +88,11 @@ pub struct TimeReporter {
 }
 
 impl TimeReporter {
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             inner: Some(TimeReporterInner {
-                name: Cow::from(name),
-                level: Level::DEBUG,
+                name: name.into(),
+                level: Level::TRACE,
                 start: crate::time::now(),
                 threshold: None,
             }),
@@ -107,7 +108,7 @@ impl TimeReporter {
         }
     }
 
-    /// Add a threshold, which will log a warning if exeeded
+    /// Add a threshold, which will log a warning if exceeded
     pub fn threshold(mut self, threshold: time::Duration) -> Self {
         Self {
             inner: self.inner.take().map(|inner| TimeReporterInner {
@@ -137,8 +138,8 @@ impl TimeReporter {
 
 impl Drop for TimeReporter {
     fn drop(&mut self) {
-        if let Some(mut inner) = self.inner.take() {
-            inner.report()
+        if let Some(inner) = self.inner.take() {
+            inner.report();
         }
     }
 }

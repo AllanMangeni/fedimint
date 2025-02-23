@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::hash::Hash;
 use std::io::Cursor;
 
-use bitcoin::util::merkleblock::PartialMerkleTree;
-use bitcoin::{BlockHash, BlockHeader, Txid};
-use bitcoin_hashes::hex::{FromHex, ToHex};
+use bitcoin::block::Header as BlockHeader;
+use bitcoin::merkle_tree::PartialMerkleTree;
+use bitcoin::{BlockHash, Txid};
+use hex::FromHex;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -37,12 +38,12 @@ impl TxOutProof {
 }
 
 impl Decodable for TxOutProof {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_partial<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        let block_header = BlockHeader::consensus_decode(d, modules)?;
-        let merkle_proof = PartialMerkleTree::consensus_decode(d, modules)?;
+        let block_header = BlockHeader::consensus_decode_partial(d, modules)?;
+        let merkle_proof = PartialMerkleTree::consensus_decode_partial(d, modules)?;
 
         let mut transactions = Vec::new();
         let mut indices = Vec::new();
@@ -50,27 +51,25 @@ impl Decodable for TxOutProof {
             .extract_matches(&mut transactions, &mut indices)
             .map_err(|_| DecodeError::from_str("Invalid partial merkle tree"))?;
 
-        if block_header.merkle_root != root {
-            Err(DecodeError::from_str(
-                "Partial merkle tree does not belong to block header",
-            ))
-        } else {
-            Ok(TxOutProof {
+        if block_header.merkle_root == root {
+            Ok(Self {
                 block_header,
                 merkle_proof,
             })
+        } else {
+            Err(DecodeError::from_str(
+                "Partial merkle tree does not belong to block header",
+            ))
         }
     }
 }
 
 impl Encodable for TxOutProof {
-    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, std::io::Error> {
-        let mut written = 0;
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+        self.block_header.consensus_encode(writer)?;
+        self.merkle_proof.consensus_encode(writer)?;
 
-        written += self.block_header.consensus_encode(writer)?;
-        written += self.merkle_proof.consensus_encode(writer)?;
-
-        Ok(written)
+        Ok(())
     }
 }
 
@@ -79,13 +78,10 @@ impl Serialize for TxOutProof {
     where
         S: Serializer,
     {
-        let mut bytes = Vec::new();
-        self.consensus_encode(&mut bytes).unwrap();
-
         if serializer.is_human_readable() {
-            serializer.serialize_str(&bytes.to_hex())
+            serializer.serialize_str(&self.consensus_encode_to_hex())
         } else {
-            serializer.serialize_bytes(&bytes)
+            serializer.serialize_bytes(&self.consensus_encode_to_vec())
         }
     }
 }
@@ -98,15 +94,15 @@ impl<'de> Deserialize<'de> for TxOutProof {
         let empty_module_registry = ModuleDecoderRegistry::default();
         if deserializer.is_human_readable() {
             let hex_str: Cow<str> = Deserialize::deserialize(deserializer)?;
-            let bytes = Vec::from_hex(&hex_str).map_err(D::Error::custom)?;
+            let bytes = Vec::from_hex(hex_str.as_ref()).map_err(D::Error::custom)?;
             Ok(
-                TxOutProof::consensus_decode(&mut Cursor::new(bytes), &empty_module_registry)
+                Self::consensus_decode_partial(&mut Cursor::new(bytes), &empty_module_registry)
                     .map_err(D::Error::custom)?,
             )
         } else {
             let bytes: &[u8] = Deserialize::deserialize(deserializer)?;
             Ok(
-                TxOutProof::consensus_decode(&mut Cursor::new(bytes), &empty_module_registry)
+                Self::consensus_decode_partial(&mut Cursor::new(bytes), &empty_module_registry)
                     .map_err(D::Error::custom)?,
             )
         }
@@ -116,14 +112,12 @@ impl<'de> Deserialize<'de> for TxOutProof {
 // TODO: upstream
 impl Hash for TxOutProof {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let mut bytes = Vec::new();
-        self.consensus_encode(&mut bytes).unwrap();
-        state.write(&bytes);
+        state.write(&self.consensus_encode_to_vec());
     }
 }
 
 impl PartialEq for TxOutProof {
-    fn eq(&self, other: &TxOutProof) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         self.block_header == other.block_header && self.merkle_proof == other.merkle_proof
     }
 }

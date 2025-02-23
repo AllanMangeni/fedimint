@@ -1,21 +1,23 @@
 [package]
 name = "fedimint-derive"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "fedimint-derive provides helper macros for serialization."
-license = "MIT"
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
+
+[features]
+diagnostics = []
 
 [lib]
 proc-macro = true
 name = "fedimint_derive"
 path = "src/lib.rs"
 
-[features]
-diagnostics = []
-
 [dependencies]
-heck = "0.4"
+itertools = { workspace = true }
 proc-macro2 = "1.0"
 quote = "1.0"
-syn = { version = "1.0", features = ["full"] }
+syn = { version = "2.0", features = ["full"] }

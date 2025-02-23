@@ -1,14 +1,22 @@
 use std::fmt::Debug;
 
-use bitcoin::secp256k1;
-use bitcoin_hashes::sha256;
+use bitcoin::hashes::{Hash, sha256};
 use fedimint_core::encoding::{Decodable, Encodable};
-use secp256k1_zkp::{KeyPair, Message, Secp256k1, Signing, Verification};
+use secp256k1::{Keypair, Message, Secp256k1, Signing, Verification};
 use serde::{Deserialize, Serialize};
+
+/// Maximum payload size of a backup request
+///
+/// Note: this is just a current hard limit,
+/// that could be changed in the future versions.
+///
+/// For comparison - at the time of writing, ecash module
+/// backup with 52 notes is around 5.1K.
+pub const BACKUP_REQUEST_MAX_PAYLOAD_SIZE_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Encodable, Decodable)]
 pub struct BackupRequest {
-    pub id: secp256k1::XOnlyPublicKey,
+    pub id: secp256k1::PublicKey,
     #[serde(with = "fedimint_core::hex::serde")]
     pub payload: Vec<u8>,
     pub timestamp: std::time::SystemTime,
@@ -19,8 +27,9 @@ impl BackupRequest {
         self.consensus_hash()
     }
 
-    pub fn sign(self, keypair: &KeyPair) -> anyhow::Result<SignedBackupRequest> {
-        let signature = secp256k1::SECP256K1.sign_schnorr(&Message::from(self.hash()), keypair);
+    pub fn sign(self, keypair: &Keypair) -> anyhow::Result<SignedBackupRequest> {
+        let signature = secp256k1::SECP256K1
+            .sign_schnorr(&Message::from_digest(*self.hash().as_ref()), keypair);
 
         Ok(SignedBackupRequest {
             request: self,
@@ -43,8 +52,9 @@ impl SignedBackupRequest {
     {
         ctx.verify_schnorr(
             &self.signature,
-            &Message::from_slice(&self.request.hash()).expect("Can't fail"),
-            &self.request.id,
+            &secp256k1::Message::from_digest_slice(&self.request.hash().to_byte_array())
+                .expect("Can't fail"),
+            &self.request.id.x_only_public_key().0,
         )?;
 
         Ok(&self.request)

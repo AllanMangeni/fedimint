@@ -1,9 +1,8 @@
-use fedimint_core::db::DatabaseTransaction;
+use fedimint_core::db::{IDatabaseTransactionOpsCoreTyped, MigrationContext};
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::epoch::{SerdeSignature, SerdeSignatureShare};
-use fedimint_core::{impl_db_lookup, impl_db_record, Amount, OutPoint, PeerId};
+use fedimint_core::secp256k1::PublicKey;
+use fedimint_core::{Amount, OutPoint, impl_db_lookup, impl_db_record};
 use futures::StreamExt;
-use secp256k1::XOnlyPublicKey;
 use serde::Serialize;
 use strum_macros::EnumIter;
 
@@ -15,8 +14,6 @@ use crate::DummyOutputOutcome;
 pub enum DbKeyPrefix {
     Funds = 0x01,
     Outcome = 0x02,
-    SignatureShare = 0x03,
-    Signature = 0x04,
 }
 
 // TODO: Boilerplate-code
@@ -29,7 +26,7 @@ impl std::fmt::Display for DbKeyPrefix {
 /// Example old version 0 of DB entries
 // TODO: can we simplify this by just using macros?
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
-pub struct DummyFundsKeyV0(pub XOnlyPublicKey);
+pub struct DummyFundsKeyV0(pub PublicKey);
 
 #[derive(Debug, Encodable, Decodable)]
 pub struct DummyFundsKeyPrefixV0;
@@ -43,7 +40,7 @@ impl_db_lookup!(key = DummyFundsKeyV0, query_prefix = DummyFundsKeyPrefixV0);
 
 /// Lookup funds for a user by key or prefix
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
-pub struct DummyFundsKeyV1(pub XOnlyPublicKey);
+pub struct DummyFundsKeyV1(pub PublicKey);
 
 #[derive(Debug, Encodable, Decodable)]
 pub struct DummyFundsPrefixV1;
@@ -56,7 +53,8 @@ impl_db_record!(
 impl_db_lookup!(key = DummyFundsKeyV1, query_prefix = DummyFundsPrefixV1);
 
 /// Example DB migration from version 0 to version 1
-pub async fn migrate_to_v1(dbtx: &mut DatabaseTransaction<'_>) -> Result<(), anyhow::Error> {
+pub async fn migrate_to_v1(mut ctx: MigrationContext<'_>) -> Result<(), anyhow::Error> {
+    let mut dbtx = ctx.dbtx();
     // Select old entries
     let v0_entries = dbtx
         .find_by_prefix(&DummyFundsKeyPrefixV0)
@@ -88,40 +86,3 @@ impl_db_record!(
     db_prefix = DbKeyPrefix::Outcome,
 );
 impl_db_lookup!(key = DummyOutcomeKey, query_prefix = DummyOutcomePrefix);
-
-/// Lookup signature requests by key or prefix
-#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
-pub struct DummySignatureShareKey(pub String, pub PeerId);
-
-#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
-pub struct DummySignatureShareStringPrefix(pub String);
-
-#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
-pub struct DummySignatureSharePrefix;
-
-impl_db_record!(
-    key = DummySignatureShareKey,
-    value = SerdeSignatureShare,
-    db_prefix = DbKeyPrefix::SignatureShare,
-);
-impl_db_lookup!(
-    key = DummySignatureShareKey,
-    query_prefix = DummySignatureShareStringPrefix,
-    query_prefix = DummySignatureSharePrefix
-);
-
-/// Lookup signature requests by key or prefix
-#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
-pub struct DummySignatureKey(pub String);
-
-#[derive(Debug, Encodable, Decodable)]
-pub struct DummySignaturePrefix;
-
-impl_db_record!(
-    key = DummySignatureKey,
-    value = Option<SerdeSignature>,
-    db_prefix = DbKeyPrefix::Signature,
-    // Allows us to listen for notifications on this key
-    notify_on_modify = true
-);
-impl_db_lookup!(key = DummySignatureKey, query_prefix = DummySignaturePrefix);

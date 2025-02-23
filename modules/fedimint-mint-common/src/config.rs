@@ -3,11 +3,12 @@ use std::collections::BTreeMap;
 use fedimint_core::config::EmptyGenParams;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::{plugin_types_trait_impl_config, Amount, PeerId, Tiered};
+use fedimint_core::module::serde_json;
+use fedimint_core::{Amount, PeerId, Tiered, plugin_types_trait_impl_config};
 use serde::{Deserialize, Serialize};
 use tbs::{AggregatePublicKey, PublicKeyShare};
 
-use crate::MintCommonGen;
+use crate::MintCommonInit;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintGenParams {
@@ -17,22 +18,36 @@ pub struct MintGenParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintGenParamsConsensus {
-    pub mint_amounts: Vec<Amount>,
+    denomination_base: u16,
+    fee_consensus: FeeConsensus,
 }
 
-const TEN_BTC_IN_SATS: u64 = 10 * 100_000_000;
+// The maximum size of an E-Cash note (1,000,000 coins)
+// Changing this value is considered a breaking change because it is not saved
+// in `MintGenParamsConsensus` but instead is hardcoded here
+const MAX_DENOMINATION_SIZE: Amount = Amount::from_bitcoins(1_000_000);
 
-impl Default for MintGenParams {
-    fn default() -> Self {
-        MintGenParams {
-            consensus: MintGenParamsConsensus {
-                mint_amounts: Tiered::gen_denominations(Amount::from_sats(TEN_BTC_IN_SATS))
-                    .tiers()
-                    .cloned()
-                    .collect(),
-            },
-            local: EmptyGenParams {},
+impl MintGenParamsConsensus {
+    pub fn new(denomination_base: u16, fee_consensus: FeeConsensus) -> Self {
+        Self {
+            denomination_base,
+            fee_consensus,
         }
+    }
+
+    pub fn denomination_base(&self) -> u16 {
+        self.denomination_base
+    }
+
+    pub fn fee_consensus(&self) -> FeeConsensus {
+        self.fee_consensus.clone()
+    }
+
+    pub fn gen_denominations(&self) -> Vec<Amount> {
+        Tiered::gen_denominations(self.denomination_base, MAX_DENOMINATION_SIZE)
+            .tiers()
+            .copied()
+            .collect()
     }
 }
 
@@ -63,7 +78,7 @@ pub struct MintConfigPrivate {
     pub tbs_sks: Tiered<tbs::SecretKeyShare>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable, Hash)]
 pub struct MintClientConfig {
     pub tbs_pks: Tiered<AggregatePublicKey>,
     pub fee_consensus: FeeConsensus,
@@ -71,9 +86,19 @@ pub struct MintClientConfig {
     pub max_notes_per_denomination: u16,
 }
 
+impl std::fmt::Display for MintClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MintClientConfig {}",
+            serde_json::to_string(self).map_err(|_e| std::fmt::Error)?
+        )
+    }
+}
+
 // Wire together the configs for this module
 plugin_types_trait_impl_config!(
-    MintCommonGen,
+    MintCommonInit,
     MintGenParams,
     EmptyGenParams,
     MintGenParamsConsensus,
@@ -86,15 +111,79 @@ plugin_types_trait_impl_config!(
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct FeeConsensus {
-    pub note_issuance_abs: fedimint_core::Amount,
-    pub note_spend_abs: fedimint_core::Amount,
+    base: Amount,
+    parts_per_million: u64,
 }
 
-impl Default for FeeConsensus {
-    fn default() -> Self {
+impl FeeConsensus {
+    /// The mint module will charge a non-configurable base fee of one hundred
+    /// millisatoshis per transaction input and output to account for the costs
+    /// incurred by the federation for processing the transaction. On top of
+    /// that the federation may charge a additional relative fee per input and
+    /// output of up to one thousand parts per million which is equal to one
+    /// tenth of one percent.
+    ///
+    /// # Errors
+    /// - This constructor returns an error if the relative fee is in excess of
+    ///   one thousand parts per million.
+    pub fn new(parts_per_million: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            parts_per_million <= 1_000,
+            "Relative fee over one thousand parts per million is excessive"
+        );
+
+        Ok(Self {
+            base: Amount::from_msats(100),
+            parts_per_million,
+        })
+    }
+
+    pub fn zero() -> Self {
         Self {
-            note_issuance_abs: fedimint_core::Amount::ZERO,
-            note_spend_abs: fedimint_core::Amount::ZERO,
+            base: Amount::ZERO,
+            parts_per_million: 0,
         }
     }
+
+    pub fn fee(&self, amount: Amount) -> Amount {
+        Amount::from_msats(self.fee_msats(amount.msats))
+    }
+
+    fn fee_msats(&self, msats: u64) -> u64 {
+        msats
+            .saturating_mul(self.parts_per_million)
+            .saturating_div(1_000_000)
+            .checked_add(self.base.msats)
+            .expect("The division creates sufficient headroom to add the base fee")
+    }
+}
+
+#[test]
+fn test_fee_consensus() {
+    let fee_consensus = FeeConsensus::new(1_000).expect("Relative fee is within range");
+
+    assert_eq!(
+        fee_consensus.fee(Amount::from_msats(999)),
+        Amount::from_msats(100)
+    );
+
+    assert_eq!(
+        fee_consensus.fee(Amount::from_sats(1)),
+        Amount::from_msats(100) + Amount::from_msats(1)
+    );
+
+    assert_eq!(
+        fee_consensus.fee(Amount::from_sats(1000)),
+        Amount::from_sats(1) + Amount::from_msats(100)
+    );
+
+    assert_eq!(
+        fee_consensus.fee(Amount::from_bitcoins(1)),
+        Amount::from_sats(100_000) + Amount::from_msats(100)
+    );
+
+    assert_eq!(
+        fee_consensus.fee(Amount::from_bitcoins(100_000)),
+        Amount::from_bitcoins(100) + Amount::from_msats(100)
+    );
 }

@@ -5,7 +5,7 @@
 This instruction is available in a script version. If you prefer it, you can run:
 
 ```
-git clone -o upstream https://github.com/fedimint/fedimint && cd fedimint && ./scripts/bootstrap.sh
+git clone -o upstream https://github.com/fedimint/fedimint && cd fedimint && ./scripts/dev/bootstrap.sh
 ```
 
 and follow the instructions instead of reading this document.
@@ -19,14 +19,6 @@ git clone git@github.com:fedimint/fedimint.git
 cd fedimint
 ```
 
-## MacOS
-
-If you encounter problems with Nix on MacOS, refer to the [macOS Guide](./macos.md).
-
-If you want to use [zld](https://github.com/michaeleisel/zld) for faster linking, you can uncomment the relevant
-lines in the `.cargo/config.toml`. Please put the `.cargo/config.toml` in your `.git/info/exclude` if you choose to use zld. In case you want
-to submit a PR changing this file, uncomment the zld configuration again.
-
 ## Set up Nix
 
 Fedimint uses [Nix](https://nixos.org/explore.html) for building, CI, and managing dev environment.
@@ -39,10 +31,9 @@ it ensures consistent and reproducible environment for all developers.
 ### Install Nix
 
 You have 2 options to install nix:
-* [The official installer](https://nixos.org/download.html)
-* The [Determinate Nix Installer](https://zero-to-nix.com/start/install) which is maintained by a 3rd party, but is a little more user-friendly.
 
-If one doesn't work for you, consider trying the other. The end result is having a working `nix` command in your shell.
+* **RECOMMENDED:** The [Determinate Nix Installer](https://github.com/DeterminateSystems/nix-installer)
+* [The official installer](https://nixos.org/download.html)
 
 Example:
 
@@ -81,22 +72,24 @@ To use a different shell for `nix develop`, try `nix develop -c zsh`. You can al
 don't want to remember about it. That's the recommended way to use a different shell
 for `nix develop`.
 
-### _Preclude nix shell + tmux problems_
+## Cachix binary cache
 
-Some of the scripts and examples in this repository make use of the `tmux` terminal multiplexer.
-However, by default a tmux instance launches a _login shell_, which can lead to unintended problems
-on certain operating systems (e.g. Debian)[^1]. Especially, when `tmux` is launched within a _nix shell_,
-as needed for [Running Fedimint for dev testing](./dev-running.md).
-
-You can preclude these problems by forcing `tmux` to always use non-login shells. Create (or edit) a `.tmux.conf`
-in your home directory with the following line:
+Fedimint uses a [Cachix](https://www.cachix.org/) binary cache to cache builds.
+To benefit from this cache and avoid building everything from scratch, you must
+ensure that your user is a [trusted user](https://nix.dev/manual/nix/stable/command-ref/conf-file.html#conf-trusted-users).
+You can do this by modifying `/etc/nix/nix.conf`, adding the following line.
 
 ```
-set -g default-command "${SHELL}"
+trusted-users = the_name_of_your_user
 ```
 
-Tmuxinator tests run 2 lightning nodes. One node, [Core Lightning](https://github.com/ElementsProject/lightning), runs as a gateway to the federation, and the other node, [LND](https://github.com/lightningnetwork/lnd), represents the rest of the Lightning network. These tests are conducted to simulate the process of sending and receiving transactions via Lightning network to and from Fedimint.
+Alternatively, if you do not want to add your user to the list of trusted users, you can
+run the following command, which will add <https://fedimint.cachix.org> and its public key
+to your nix configuration.
 
+```
+nix develop .#bootstrap -c cachix use fedimint
+```
 
 ## Setting up `direnv` or `lorri`
 
@@ -111,8 +104,6 @@ project they will automatically set up the environment for you, without starting
 new shells. This way you can preserve your shell, and your settings while using
 `nix develop`-like shell automatically.
 
-[^1]: [issues/506](https://github.com/fedimint/fedimint/issues/506): scripts/tmuxinator.sh prerequisites and issues
-
 ## Cross-compilation
 
 Dev environment comes with support for cross-compilation. However since most developers
@@ -126,7 +117,7 @@ nix develop .#cross
 Inside the shell cross-compilation commands like:
 
 ```
-cargo build --target wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --package fedimint-client
 ```
 
 should work as expected.

@@ -1,53 +1,74 @@
+#![deny(clippy::pedantic)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::return_self_not_must_use)]
+
 use std::hash::Hasher;
 
-use bitcoin::hashes::hex::ToHex;
-use bitcoin::util::psbt::raw::ProprietaryKey;
-use bitcoin::util::psbt::PartiallySignedTransaction;
-use bitcoin::{Amount, BlockHash, Network, Script, Transaction, Txid};
+use bitcoin::address::NetworkUnchecked;
+use bitcoin::psbt::raw::ProprietaryKey;
+use bitcoin::{Address, Amount, BlockHash, TxOut, Txid, secp256k1};
+use config::WalletClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
-use fedimint_core::encoding::{Decodable, Encodable, UnzipConsensus};
-use fedimint_core::module::{CommonModuleGen, ModuleCommon, ModuleConsensusVersion};
-use fedimint_core::{plugin_types_trait_impl_common, Feerate, PeerId};
+use fedimint_core::encoding::btc::NetworkLegacyEncodingWrapper;
+use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::module::{CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
+use fedimint_core::{Feerate, extensible_associated_module_type, plugin_types_trait_impl_common};
 use impl_tools::autoimpl;
 use miniscript::Descriptor;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::error;
 
-use crate::db::UTXOKey;
 use crate::keys::CompressedPublicKey;
 use crate::txoproof::{PegInProof, PegInProofError};
 
 pub mod config;
-pub mod db;
+pub mod endpoint_constants;
+pub mod envs;
 pub mod keys;
 pub mod tweakable;
 pub mod txoproof;
 
 pub const KIND: ModuleKind = ModuleKind::from_static_str("wallet");
-const CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion(0);
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(2, 2);
 
-pub const CONFIRMATION_TARGET: u16 = 10;
+/// Module consensus version that introduced support for processing Bitcoin
+/// transactions that exceed the `ALEPH_BFT_UNIT_BYTE_LIMIT`.
+pub const SAFE_DEPOSIT_MODULE_CONSENSUS_VERSION: ModuleConsensusVersion =
+    ModuleConsensusVersion::new(2, 2);
+
+/// To further mitigate the risk of a peg-out transaction getting stuck in the
+/// mempool, we multiply the feerate estimate returned from the backend by this
+/// value.
+pub const FEERATE_MULTIPLIER_DEFAULT: f64 = 2.0;
 
 pub type PartialSig = Vec<u8>;
 
 pub type PegInDescriptor = Descriptor<CompressedPublicKey>;
 
-#[derive(
-    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, UnzipConsensus, Encodable, Decodable,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub enum WalletConsensusItem {
-    BlockHeight(u32), /* FIXME: use block hash instead, but needs more complicated
-                       * * verification logic */
+    BlockCount(u32), /* FIXME: use block hash instead, but needs more complicated
+                      * * verification logic */
     Feerate(Feerate),
     PegOutSignature(PegOutSignatureItem),
+    ModuleConsensusVersion(ModuleConsensusVersion),
+    #[encodable_default]
+    Default {
+        variant: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 impl std::fmt::Display for WalletConsensusItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WalletConsensusItem::BlockHeight(height) => {
-                write!(f, "Wallet Block Height {height}")
+            WalletConsensusItem::BlockCount(count) => {
+                write!(f, "Wallet Block Count {count}")
             }
             WalletConsensusItem::Feerate(feerate) => {
                 write!(
@@ -58,6 +79,16 @@ impl std::fmt::Display for WalletConsensusItem {
             }
             WalletConsensusItem::PegOutSignature(sig) => {
                 write!(f, "Wallet PegOut signature for Bitcoin TxId {}", sig.txid)
+            }
+            WalletConsensusItem::ModuleConsensusVersion(version) => {
+                write!(
+                    f,
+                    "Wallet Consensus Version {}.{}",
+                    version.major, version.minor
+                )
+            }
+            WalletConsensusItem::Default { variant, .. } => {
+                write!(f, "Unknown Wallet CI variant={variant}")
             }
         }
     }
@@ -71,71 +102,125 @@ pub struct PegOutSignatureItem {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct SpendableUTXO {
-    pub tweak: [u8; 32],
-    #[serde(with = "bitcoin::util::amount::serde::as_sat")]
+    #[serde(with = "::fedimint_core::encoding::as_hex")]
+    pub tweak: [u8; 33],
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub amount: bitcoin::Amount,
 }
 
-/// A peg-out tx that is ready to be broadcast with a tweak for the change UTXO
-#[derive(Clone, Debug, Encodable, Decodable)]
-pub struct PendingTransaction {
-    pub tx: Transaction,
-    pub tweak: [u8; 32],
-    pub change: bitcoin::Amount,
-    pub destination: Script,
-    pub fees: PegOutFees,
-    pub selected_utxos: Vec<(UTXOKey, SpendableUTXO)>,
-    pub peg_out_amount: Amount,
-    pub rbf: Option<Rbf>,
+/// A transaction output, either unspent or consumed
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct TxOutputSummary {
+    pub outpoint: bitcoin::OutPoint,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub amount: bitcoin::Amount,
 }
 
-impl Serialize for PendingTransaction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut bytes = Vec::new();
-        self.consensus_encode(&mut bytes).unwrap();
-
-        if serializer.is_human_readable() {
-            serializer.serialize_str(&bytes.to_hex())
-        } else {
-            serializer.serialize_bytes(&bytes)
-        }
-    }
-}
-
-/// A PSBT that is awaiting enough signatures from the federation to becoming a
-/// `PendingTransaction`
-#[derive(Clone, Debug, Eq, PartialEq, Encodable, Decodable)]
-pub struct UnsignedTransaction {
-    pub psbt: PartiallySignedTransaction,
-    pub signatures: Vec<(PeerId, PegOutSignatureItem)>,
-    pub change: bitcoin::Amount,
-    pub fees: PegOutFees,
-    pub destination: Script,
-    pub selected_utxos: Vec<(UTXOKey, SpendableUTXO)>,
-    pub peg_out_amount: Amount,
-    pub rbf: Option<Rbf>,
-}
-
-impl Serialize for UnsignedTransaction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut bytes = Vec::new();
-        self.consensus_encode(&mut bytes).unwrap();
-
-        if serializer.is_human_readable() {
-            serializer.serialize_str(&bytes.to_hex())
-        } else {
-            serializer.serialize_bytes(&bytes)
-        }
-    }
-}
-
+/// Summary of the coins within the wallet.
+///
+/// Coins within the wallet go from spendable, to consumed in a transaction that
+/// does not have threshold signatures (unsigned), to threshold signed and
+/// unconfirmed on-chain (unconfirmed).
+///
+/// This summary provides the most granular view possible of coins in the
+/// wallet.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct WalletSummary {
+    /// All UTXOs available as inputs for transactions
+    pub spendable_utxos: Vec<TxOutputSummary>,
+    /// Transaction outputs consumed in peg-out transactions that have not
+    /// reached threshold signatures
+    pub unsigned_peg_out_txos: Vec<TxOutputSummary>,
+    /// Change UTXOs created from peg-out transactions that have not reached
+    /// threshold signatures
+    pub unsigned_change_utxos: Vec<TxOutputSummary>,
+    /// Transaction outputs consumed in peg-out transactions that have reached
+    /// threshold signatures waiting for finality delay confirmations
+    pub unconfirmed_peg_out_txos: Vec<TxOutputSummary>,
+    /// Change UTXOs created from peg-out transactions that have reached
+    /// threshold signatures waiting for finality delay confirmations
+    pub unconfirmed_change_utxos: Vec<TxOutputSummary>,
+}
+
+impl WalletSummary {
+    fn sum<'a>(txos: impl Iterator<Item = &'a TxOutputSummary>) -> Amount {
+        txos.fold(Amount::ZERO, |acc, txo| txo.amount + acc)
+    }
+
+    /// Total amount of all spendable UTXOs
+    pub fn total_spendable_balance(&self) -> Amount {
+        WalletSummary::sum(self.spendable_utxos.iter())
+    }
+
+    /// Total amount of all transaction outputs from peg-out transactions that
+    /// have not reached threshold signatures
+    pub fn total_unsigned_peg_out_balance(&self) -> Amount {
+        WalletSummary::sum(self.unsigned_peg_out_txos.iter())
+    }
+
+    /// Total amount of all change UTXOs from peg-out transactions that have not
+    /// reached threshold signatures
+    pub fn total_unsigned_change_balance(&self) -> Amount {
+        WalletSummary::sum(self.unsigned_change_utxos.iter())
+    }
+
+    /// Total amount of all transaction outputs from peg-out transactions that
+    /// have reached threshold signatures waiting for finality delay
+    /// confirmations
+    pub fn total_unconfirmed_peg_out_balance(&self) -> Amount {
+        WalletSummary::sum(self.unconfirmed_peg_out_txos.iter())
+    }
+
+    /// Total amount of all change UTXOs from peg-out transactions that have
+    /// reached threshold signatures waiting for finality delay confirmations
+    pub fn total_unconfirmed_change_balance(&self) -> Amount {
+        WalletSummary::sum(self.unconfirmed_change_utxos.iter())
+    }
+
+    /// Total amount of all transaction outputs from peg-out transactions that
+    /// are either waiting for threshold signatures or confirmations. This is
+    /// the total in-flight amount leaving the wallet.
+    pub fn total_pending_peg_out_balance(&self) -> Amount {
+        self.total_unsigned_peg_out_balance() + self.total_unconfirmed_peg_out_balance()
+    }
+
+    /// Total amount of all change UTXOs from peg-out transactions that are
+    /// either waiting for threshold signatures or confirmations. This is the
+    /// total in-flight amount that will become spendable by the wallet.
+    pub fn total_pending_change_balance(&self) -> Amount {
+        self.total_unsigned_change_balance() + self.total_unconfirmed_change_balance()
+    }
+
+    /// Total amount of immediately spendable UTXOs and pending change UTXOs.
+    /// This is the spendable balance once all transactions confirm.
+    pub fn total_owned_balance(&self) -> Amount {
+        self.total_spendable_balance() + self.total_pending_change_balance()
+    }
+
+    /// All transaction outputs from peg-out transactions that are either
+    /// waiting for threshold signatures or confirmations. These are all the
+    /// in-flight coins leaving the wallet.
+    pub fn pending_peg_out_txos(&self) -> Vec<TxOutputSummary> {
+        self.unsigned_peg_out_txos
+            .clone()
+            .into_iter()
+            .chain(self.unconfirmed_peg_out_txos.clone())
+            .collect()
+    }
+
+    /// All change UTXOs from peg-out transactions that are either waiting for
+    /// threshold signatures or confirmations. These are all the in-flight coins
+    /// that will become spendable by the wallet.
+    pub fn pending_change_utxos(&self) -> Vec<TxOutputSummary> {
+        self.unsigned_change_utxos
+            .clone()
+            .into_iter()
+            .chain(self.unconfirmed_change_utxos.clone())
+            .collect()
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct PegOutFees {
     pub fee_rate: Feerate,
     pub total_weight: u64,
@@ -156,39 +241,124 @@ impl PegOutFees {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct PegOut {
-    pub recipient: bitcoin::Address,
-    #[serde(with = "bitcoin::util::amount::serde::as_sat")]
+    pub recipient: Address<NetworkUnchecked>,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub amount: bitcoin::Amount,
     pub fees: PegOutFees,
+}
+
+extensible_associated_module_type!(
+    WalletOutputOutcome,
+    WalletOutputOutcomeV0,
+    UnknownWalletOutputOutcomeVariantError
+);
+
+impl WalletOutputOutcome {
+    pub fn new_v0(txid: bitcoin::Txid) -> WalletOutputOutcome {
+        WalletOutputOutcome::V0(WalletOutputOutcomeV0(txid))
+    }
 }
 
 /// Contains the Bitcoin transaction id of the transaction created by the
 /// withdraw request
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
-pub struct WalletOutputOutcome(pub bitcoin::Txid);
+pub struct WalletOutputOutcomeV0(pub bitcoin::Txid);
 
-impl std::fmt::Display for WalletOutputOutcome {
+impl std::fmt::Display for WalletOutputOutcomeV0 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Wallet PegOut Bitcoin TxId {}", self.0)
     }
 }
 
 #[derive(Debug)]
-pub struct WalletCommonGen;
+pub struct WalletCommonInit;
 
-impl CommonModuleGen for WalletCommonGen {
-    const CONSENSUS_VERSION: ModuleConsensusVersion = CONSENSUS_VERSION;
+impl CommonModuleInit for WalletCommonInit {
+    const CONSENSUS_VERSION: ModuleConsensusVersion = MODULE_CONSENSUS_VERSION;
     const KIND: ModuleKind = KIND;
+
+    type ClientConfig = WalletClientConfig;
+
     fn decoder() -> Decoder {
         WalletModuleTypes::decoder()
     }
 }
 
-#[autoimpl(Deref, DerefMut using self.0)]
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
-pub struct WalletInput(pub Box<PegInProof>);
+pub enum WalletInput {
+    V0(WalletInputV0),
+    V1(WalletInputV1),
+    #[encodable_default]
+    Default {
+        variant: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+impl WalletInput {
+    pub fn maybe_v0_ref(&self) -> Option<&WalletInputV0> {
+        match self {
+            WalletInput::V0(v0) => Some(v0),
+            _ => None,
+        }
+    }
+}
+
+#[derive(
+    Debug,
+    thiserror::Error,
+    Clone,
+    Eq,
+    PartialEq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    fedimint_core::encoding::Encodable,
+    fedimint_core::encoding::Decodable,
+)]
+#[error("Unknown {} variant {variant}", stringify!($name))]
+pub struct UnknownWalletInputVariantError {
+    pub variant: u64,
+}
 
 impl std::fmt::Display for WalletInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            WalletInput::V0(inner) => std::fmt::Display::fmt(&inner, f),
+            WalletInput::V1(inner) => std::fmt::Display::fmt(&inner, f),
+            WalletInput::Default { variant, .. } => {
+                write!(f, "Unknown variant (variant={variant})")
+            }
+        }
+    }
+}
+
+impl WalletInput {
+    pub fn new_v0(peg_in_proof: PegInProof) -> WalletInput {
+        WalletInput::V0(WalletInputV0(Box::new(peg_in_proof)))
+    }
+
+    pub fn new_v1(peg_in_proof: &PegInProof) -> WalletInput {
+        WalletInput::V1(WalletInputV1 {
+            outpoint: peg_in_proof.outpoint(),
+            tweak_contract_key: *peg_in_proof.tweak_contract_key(),
+            tx_out: peg_in_proof.tx_output(),
+        })
+    }
+}
+
+#[autoimpl(Deref, DerefMut using self.0)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct WalletInputV0(pub Box<PegInProof>);
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct WalletInputV1 {
+    pub outpoint: bitcoin::OutPoint,
+    pub tweak_contract_key: secp256k1::PublicKey,
+    pub tx_out: TxOut,
+}
+
+impl std::fmt::Display for WalletInputV0 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -198,8 +368,37 @@ impl std::fmt::Display for WalletInput {
     }
 }
 
+impl std::fmt::Display for WalletInputV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wallet PegIn V1 with TxId {}", self.outpoint.txid)
+    }
+}
+
+extensible_associated_module_type!(
+    WalletOutput,
+    WalletOutputV0,
+    UnknownWalletOutputVariantError
+);
+
+impl WalletOutput {
+    pub fn new_v0_peg_out(
+        recipient: Address,
+        amount: bitcoin::Amount,
+        fees: PegOutFees,
+    ) -> WalletOutput {
+        WalletOutput::V0(WalletOutputV0::PegOut(PegOut {
+            recipient: recipient.into_unchecked(),
+            amount,
+            fees,
+        }))
+    }
+    pub fn new_v0_rbf(fees: PegOutFees, txid: Txid) -> WalletOutput {
+        WalletOutput::V0(WalletOutputV0::Rbf(Rbf { fees, txid }))
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
-pub enum WalletOutput {
+pub enum WalletOutputV0 {
     PegOut(PegOut),
     Rbf(Rbf),
 }
@@ -213,22 +412,27 @@ pub struct Rbf {
     pub txid: Txid,
 }
 
-impl WalletOutput {
+impl WalletOutputV0 {
     pub fn amount(&self) -> Amount {
         match self {
-            WalletOutput::PegOut(pegout) => pegout.amount + pegout.fees.amount(),
-            WalletOutput::Rbf(rbf) => rbf.fees.amount(),
+            WalletOutputV0::PegOut(pegout) => pegout.amount + pegout.fees.amount(),
+            WalletOutputV0::Rbf(rbf) => rbf.fees.amount(),
         }
     }
 }
 
-impl std::fmt::Display for WalletOutput {
+impl std::fmt::Display for WalletOutputV0 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WalletOutput::PegOut(pegout) => {
-                write!(f, "Wallet PegOut {} to {}", pegout.amount, pegout.recipient)
+            WalletOutputV0::PegOut(pegout) => {
+                write!(
+                    f,
+                    "Wallet PegOut {} to {}",
+                    pegout.amount,
+                    pegout.recipient.clone().assume_checked()
+                )
             }
-            WalletOutput::Rbf(rbf) => write!(f, "Wallet RBF {:?} to {}", rbf.fees, rbf.txid),
+            WalletOutputV0::Rbf(rbf) => write!(f, "Wallet RBF {:?} to {}", rbf.fees, rbf.txid),
         }
     }
 }
@@ -246,7 +450,7 @@ pub fn proprietary_tweak_key() -> ProprietaryKey {
 impl std::hash::Hash for PegOutSignatureItem {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.txid.hash(state);
-        for sig in self.signature.iter() {
+        for sig in &self.signature {
             sig.serialize_der().hash(state);
         }
     }
@@ -261,27 +465,49 @@ impl PartialEq for PegOutSignatureItem {
 impl Eq for PegOutSignatureItem {}
 
 plugin_types_trait_impl_common!(
+    KIND,
     WalletModuleTypes,
+    WalletClientConfig,
     WalletInput,
     WalletOutput,
     WalletOutputOutcome,
-    WalletConsensusItem
+    WalletConsensusItem,
+    WalletInputError,
+    WalletOutputError
 );
 
-#[derive(Debug, Error)]
-pub enum WalletError {
+#[derive(Debug, Error, Clone)]
+pub enum WalletCreationError {
     #[error("Connected bitcoind is on wrong network, expected {0}, got {1}")]
-    WrongNetwork(Network, Network),
+    WrongNetwork(NetworkLegacyEncodingWrapper, NetworkLegacyEncodingWrapper),
     #[error("Error querying bitcoind: {0}")]
-    RpcError(#[from] anyhow::Error),
-    #[error("Unknown bitcoin network: {0}")]
-    UnknownNetwork(String),
+    RpcError(String),
+    #[error("Feerate source error: {0}")]
+    FeerateSourceError(String),
+}
+
+#[derive(Debug, Error, Encodable, Decodable, Hash, Clone, Eq, PartialEq)]
+pub enum WalletInputError {
     #[error("Unknown block hash in peg-in proof: {0}")]
     UnknownPegInProofBlock(BlockHash),
     #[error("Invalid peg-in proof: {0}")]
     PegInProofError(#[from] PegInProofError),
     #[error("The peg-in was already claimed")]
     PegInAlreadyClaimed,
+    #[error("The wallet input version is not supported by this federation")]
+    UnknownInputVariant(#[from] UnknownWalletInputVariantError),
+    #[error("Unknown UTXO")]
+    UnknownUTXO,
+    #[error("Wrong output script")]
+    WrongOutputScript,
+    #[error("Wrong tx out")]
+    WrongTxOut,
+}
+
+#[derive(Debug, Error, Encodable, Decodable, Hash, Clone, Eq, PartialEq)]
+pub enum WalletOutputError {
+    #[error("Connected bitcoind is on wrong network, expected {0}, got {1}")]
+    WrongNetwork(NetworkLegacyEncodingWrapper, NetworkLegacyEncodingWrapper),
     #[error("Peg-out fee rate {0:?} is set below consensus {1:?}")]
     PegOutFeeBelowConsensus(Feerate, Feerate),
     #[error("Not enough SpendableUTXO")]
@@ -294,7 +520,15 @@ pub enum WalletError {
     TxWeightIncorrect(u64, u64),
     #[error("Peg-out fee rate is below min relay fee")]
     BelowMinRelayFee,
+    #[error("The wallet output version is not supported by this federation")]
+    UnknownOutputVariant(#[from] UnknownWalletOutputVariantError),
 }
+
+// For backwards-compatibility with old clients, we use an UnknownOutputVariant
+// error when a client attempts a deprecated RBF withdrawal.
+// see: https://github.com/fedimint/fedimint/issues/5453
+pub const DEPRECATED_RBF_ERROR: WalletOutputError =
+    WalletOutputError::UnknownOutputVariant(UnknownWalletOutputVariantError { variant: 1 });
 
 #[derive(Debug, Error)]
 pub enum ProcessPegOutSigError {
@@ -315,14 +549,3 @@ pub enum ProcessPegOutSigError {
     #[error("Error finalizing PSBT {0:?}")]
     ErrorFinalizingPsbt(Vec<miniscript::psbt::Error>),
 }
-
-// FIXME: make tests not require Eq
-/// **WARNING**: this is only intended to be used for testing
-impl PartialEq for WalletError {
-    fn eq(&self, other: &Self) -> bool {
-        format!("{self:?}") == format!("{other:?}")
-    }
-}
-
-/// **WARNING**: this is only intended to be used for testing
-impl Eq for WalletError {}

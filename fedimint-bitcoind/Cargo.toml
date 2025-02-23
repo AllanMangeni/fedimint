@@ -1,31 +1,37 @@
 [package]
 name = "fedimint-bitcoind"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "Bitcoin Core connectivity used by Fedimint"
-license = "MIT"
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[features]
+default = ["bitcoincore-rpc", "esplora-client"]
+
 [lib]
 name = "fedimint_bitcoind"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.66"
-async-trait = "*"
-bitcoin = "0.29.2"
-bitcoin_hashes = "0.11.0"
-bitcoincore-rpc = { version = "0.16.0", optional = true }
-electrum-client = {version = "0.12.0", optional = true }
-esplora-client = { version = "0.5.0", default-features = false, features = ["async", "async-https-rustls"], optional = true }
-lazy_static = "1.4.0"
-fedimint-core  = { path = "../fedimint-core" }
-fedimint-logging = { path = "../fedimint-logging" }
-rand = "0.8"
-serde = { version = "1.0.149", features = [ "derive" ] }
-tracing = "0.1.37"
-url = "2.3.1"
-
-[features]
-default = ["bitcoincore-rpc", "electrum-client", "esplora-client"]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc = { workspace = true, optional = true }
+esplora-client = { workspace = true, optional = true }
+fedimint-core = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-server-core = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+jaq-core = { workspace = true }
+jaq-json = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

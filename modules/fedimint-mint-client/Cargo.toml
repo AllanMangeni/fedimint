@@ -1,48 +1,67 @@
 [package]
 name = "fedimint-mint-client"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "fedimint-mint is a chaumian ecash mint module."
-license = "MIT"
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[package.metadata.cargo-udeps.ignore]
+# cargo udeps can't detect that one
+normal = ["aquamarine"]
+
+[features]
+default = []
+cli = ["dep:clap"]
+
 [lib]
 name = "fedimint_mint_client"
 path = "src/lib.rs"
 
+[[bench]]
+name = "notes"
+path = "benches/notes.rs"
+harness = false
+
 [dependencies]
-anyhow = "1.0.66"
-async-stream = "0.3.5"
-async-trait = "0.1"
-aquamarine = "0.3.1"
-base64 = "0.20.0"
-bincode = "1.3.1"
-bitcoin_hashes = "0.11.0"
-erased-serde = "0.3"
-futures = "0.3"
-itertools = "0.10.5"
-fedimint-core ={ path = "../../fedimint-core" }
-fedimint-client = { path = "../../fedimint-client" }
-fedimint-derive-secret = { path = "../../crypto/derive-secret"}
-fedimint-mint-common ={ path = "../fedimint-mint-common" }
-fedimint-logging ={ path = "../../fedimint-logging" }
-rand = "0.8"
-secp256k1 = "0.24.2"
-secp256k1-zkp = "0.7.0"
-serde = { version = "1.0.149", features = [ "derive" ] }
-serde-big-array = "0.5.1"
-serde_json = "1.0.96"
-strum = "0.24"
-strum_macros = "0.24"
-tbs = { path = "../../crypto/tbs" }
-thiserror = "1.0.39"
-threshold_crypto = { git = "https://github.com/fedimint/threshold_crypto" }
-tokio = { version = "1.27.0", features = [ "sync" ] }
-tracing ="0.1.37"
+anyhow = { workspace = true }
+aquamarine = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+base64-url = { workspace = true }
+bitcoin_hashes = { workspace = true }
+bls12_381 = { workspace = true }
+clap = { workspace = true, optional = true }
+erased-serde = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-derive-secret = { workspace = true }
+fedimint-eventlog = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-mint-common = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde-big-array = { workspace = true }
+serde_json = { workspace = true }
+serdect = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tbs = { workspace = true }
+thiserror = { workspace = true }
+threshold_crypto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-rand = "0.8"
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
-test-log = { version = "0.2", features = [ "trace" ], default-features = false }
-tokio = { version = "1.27.0", features = [ "macros", "rt" ] }
+criterion = { workspace = true }
+test-log = { workspace = true }

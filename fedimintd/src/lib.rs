@@ -1,64 +1,38 @@
-use bitcoin::Network;
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
-use fedimint_core::config::ServerModuleGenParamsRegistry;
-use fedimint_core::core::{
-    LEGACY_HARDCODED_INSTANCE_ID_LN, LEGACY_HARDCODED_INSTANCE_ID_MINT,
-    LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-};
-use fedimint_core::module::ServerModuleGen;
-use fedimint_core::{Amount, Tiered};
-use fedimint_ln_server::common::config::LightningGenParams;
-use fedimint_ln_server::LightningGen;
-use fedimint_mint_server::common::config::{MintGenParams, MintGenParamsConsensus};
-use fedimint_mint_server::MintGen;
-use fedimint_wallet_server::common::config::{
-    WalletGenParams, WalletGenParamsConsensus, WalletGenParamsLocal,
-};
-use fedimint_wallet_server::WalletGen;
+#![deny(clippy::pedantic)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::return_self_not_must_use)]
 
 /// Module for creating `fedimintd` binary with custom modules
-pub mod fedimintd;
+use bitcoin::Network;
+use fedimint_core::envs::BitcoinRpcConfig;
+use fedimint_core::util::SafeUrl;
+pub use fedimintd::*;
 
-/// Generates the configuration for the modules configured in the server binary
-pub fn attach_default_module_gen_params(
-    bitcoin_rpc: BitcoinRpcConfig,
-    module_gen_params: &mut ServerModuleGenParamsRegistry,
-    max_denomination: Amount,
-    network: Network,
-    finality_delay: u32,
-) {
-    module_gen_params
-        .attach_config_gen_params(
-            LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-            WalletGen::kind(),
-            WalletGenParams {
-                local: WalletGenParamsLocal {
-                    bitcoin_rpc: bitcoin_rpc.clone(),
-                },
-                consensus: WalletGenParamsConsensus {
-                    network,
-                    // TODO this is not very elegant, but I'm planning to get rid of it in a next
-                    // commit anyway
-                    finality_delay,
-                },
-            },
-        )
-        .attach_config_gen_params(
-            LEGACY_HARDCODED_INSTANCE_ID_MINT,
-            MintGen::kind(),
-            MintGenParams {
-                local: Default::default(),
-                consensus: MintGenParamsConsensus {
-                    mint_amounts: Tiered::gen_denominations(max_denomination)
-                        .tiers()
-                        .cloned()
-                        .collect(),
-                },
-            },
-        )
-        .attach_config_gen_params(
-            LEGACY_HARDCODED_INSTANCE_ID_LN,
-            LightningGen::kind(),
-            LightningGenParams::regtest(bitcoin_rpc),
-        );
+mod fedimintd;
+
+pub mod envs;
+use crate::envs::FM_PORT_ESPLORA_ENV;
+
+pub fn default_esplora_server(network: Network) -> BitcoinRpcConfig {
+    let url = match network {
+        Network::Bitcoin => SafeUrl::parse("https://blockstream.info/api/")
+            .expect("Failed to parse default esplora server"),
+        Network::Testnet => SafeUrl::parse("https://blockstream.info/testnet/api/")
+            .expect("Failed to parse default esplora server"),
+        Network::Regtest => SafeUrl::parse(&format!(
+            "http://127.0.0.1:{}/",
+            std::env::var(FM_PORT_ESPLORA_ENV).unwrap_or(String::from("50002"))
+        ))
+        .expect("Failed to parse default esplora server"),
+        Network::Signet => SafeUrl::parse("https://blockstream.info/signet/api/")
+            .expect("Failed to parse default esplora server"),
+        _ => panic!("Failed to parse default esplora server"),
+    };
+    BitcoinRpcConfig {
+        kind: "esplora".to_string(),
+        url,
+    }
 }

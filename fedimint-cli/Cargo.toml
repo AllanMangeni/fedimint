@@ -1,12 +1,21 @@
 [package]
 name = "fedimint-cli"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
-description = "fedimint-cli is a command line interface wrapper for the client library."
-license = "MIT"
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+readme = { workspace = true }
+description = "Fedimint client CLI interface"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[features]
+default = ["tor"]
+tor = ["fedimint-client/tor", "fedimint-api-client/tor"]
+
 [[bin]]
 name = "fedimint-cli"
 path = "src/main.rs"
@@ -16,32 +25,39 @@ name = "fedimint_cli"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.66"
-base64 = "0.20.0"
-bitcoin = "0.29.2"
-bitcoin_hashes = "0.11.0"
-clap = { version = "4.1.6", features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env" ], default-features = false }
-futures = "0.3.28"
-lightning-invoice = { version = "0.21.0", features = [ "serde" ] }
-fedimint-aead = { path = "../crypto/aead" }
-fedimint-client = { path = "../fedimint-client" }
-fedimint-core ={ path = "../fedimint-core" }
-fedimint-rocksdb = { path = "../fedimint-rocksdb" }
-fedimint-mint-client = { path = "../modules/fedimint-mint-client" }
-fedimint-mint-common = { path = "../modules/fedimint-mint-common" }
-fedimint-ln-client = { path = "../modules/fedimint-ln-client" }
-fedimint-wallet-client = { path = "../modules/fedimint-wallet-client" }
-fedimint-logging = { path = "../fedimint-logging" }
-fedimint-server = { path = "../fedimint-server" }
-rand = "0.8"
-serde = { version = "1.0.149", features = [ "derive" ] }
-thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = ["full"] }
-tracing ="0.1.37"
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
-serde_json = "1.0.91"
-url = { version = "2.3.1", features = ["serde"] }
-clap_complete = "4.3.1"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4.5.44"
+fedimint-aead = { workspace = true }
+fedimint-api-client = { path = "../fedimint-api-client", version = "=0.7.0-alpha" }
+fedimint-bip39 = { workspace = true }
+fedimint-client = { path = "../fedimint-client", version = "=0.7.0-alpha" }
+fedimint-core = { workspace = true }
+fedimint-eventlog = { workspace = true }
+fedimint-ln-client = { workspace = true, features = ["cli"] }
+fedimint-lnv2-client = { workspace = true, features = ["cli"] }
+fedimint-logging = { workspace = true }
+fedimint-meta-client = { workspace = true, features = ["cli"] }
+fedimint-mint-client = { workspace = true, features = ["cli"] }
+fedimint-rocksdb = { workspace = true }
+fedimint-wallet-client = { workspace = true, features = ["cli"] }
+fs-lock = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+lightning-invoice = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { version = "0.3.37", features = ["formatting"] }
+tokio = { workspace = true, features = ["full", "tracing"] }
+tracing = { workspace = true }
 
 [build-dependencies]
-fedimint-build = { path = "../fedimint-build" }
+fedimint-build = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }

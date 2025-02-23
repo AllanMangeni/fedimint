@@ -1,40 +1,98 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::future::Future;
+use std::ops::ControlFlow;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{env, unreachable};
 
-use anyhow::{anyhow, bail};
-use fedimint_core::task;
+use anyhow::{Context, Result, anyhow, bail, format_err};
+use fedimint_api_client::api::StatusResponse;
+use fedimint_core::PeerId;
+use fedimint_core::admin_client::{PeerServerParams, ServerStatus};
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
+use fedimint_core::envs::{FM_ENABLE_MODULE_LNV2_ENV, is_env_var_set};
+use fedimint_core::module::ApiAuth;
+use fedimint_core::task::{self, block_in_place, block_on};
+use fedimint_core::time::now;
+use fedimint_core::util::FmtCompactAnyhow as _;
+use fedimint_core::util::backoff_util::custom_backoff;
+use fedimint_logging::LOG_DEVIMINT;
+use legacy_types::ConfigGenParamsResponseLegacy;
+use semver::Version;
 use serde::de::DeserializeOwned;
 use tokio::fs::OpenOptions;
 use tokio::process::Child;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::*;
+use crate::envs::{
+    FM_BACKWARDS_COMPATIBILITY_TEST_ENV, FM_BITCOIN_CLI_BASE_EXECUTABLE_ENV,
+    FM_BITCOIND_BASE_EXECUTABLE_ENV, FM_BTC_CLIENT_ENV, FM_CLIENT_DIR_ENV,
+    FM_DEVIMINT_CMD_INHERIT_STDERR_ENV, FM_ELECTRS_BASE_EXECUTABLE_ENV,
+    FM_ESPLORA_BASE_EXECUTABLE_ENV, FM_FAUCET_BASE_EXECUTABLE_ENV,
+    FM_FEDIMINT_CLI_BASE_EXECUTABLE_ENV, FM_FEDIMINT_DBTOOL_BASE_EXECUTABLE_ENV,
+    FM_FEDIMINTD_BASE_EXECUTABLE_ENV, FM_GATEWAY_CLI_BASE_EXECUTABLE_ENV,
+    FM_GATEWAYD_BASE_EXECUTABLE_ENV, FM_GWCLI_LND_ENV, FM_LIGHTNING_CLI_BASE_EXECUTABLE_ENV,
+    FM_LIGHTNING_CLI_ENV, FM_LIGHTNINGD_BASE_EXECUTABLE_ENV, FM_LNCLI_BASE_EXECUTABLE_ENV,
+    FM_LNCLI_ENV, FM_LND_BASE_EXECUTABLE_ENV, FM_LOAD_TEST_TOOL_BASE_EXECUTABLE_ENV,
+    FM_LOGS_DIR_ENV, FM_MINT_CLIENT_ENV, FM_RECOVERYTOOL_BASE_EXECUTABLE_ENV,
+};
 
-fn kill(child: &Child) {
+// If a binary doesn't provide a clap version, default to the first stable
+// release (v0.2.1)
+const DEFAULT_VERSION: Version = Version::new(0, 2, 1);
+
+pub fn parse_map(s: &str) -> Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+
+    if s.is_empty() {
+        return Ok(map);
+    }
+
+    for pair in s.split(',') {
+        let parts: Vec<&str> = pair.split('=').collect();
+        if parts.len() == 2 {
+            map.insert(parts[0].to_string(), parts[1].to_string());
+        } else {
+            return Err(format_err!("Invalid pair in map: {}", pair));
+        }
+    }
+    Ok(map)
+}
+
+fn send_sigterm(child: &Child) {
+    send_signal(child, nix::sys::signal::Signal::SIGTERM);
+}
+
+fn send_sigkill(child: &Child) {
+    send_signal(child, nix::sys::signal::Signal::SIGKILL);
+}
+
+fn send_signal(child: &Child, signal: nix::sys::signal::Signal) {
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id().expect("pid should be present") as _),
-        nix::sys::signal::Signal::SIGTERM,
+        signal,
     );
 }
 
 /// Kills process when all references to ProcessHandle are dropped.
 ///
 /// NOTE: drop order is significant make sure fields in struct are declared in
-/// correct order it is generallly clients, process handle, deps
+/// correct order it is generally clients, process handle, deps
 #[derive(Debug, Clone)]
-pub struct ProcessHandle(Arc<ProcessHandleInner>);
+pub struct ProcessHandle(Arc<Mutex<ProcessHandleInner>>);
 
 impl ProcessHandle {
-    pub async fn kill(self) -> Result<()> {
-        let arc_process_handle_inner = self.0;
-        let mut process_handle_inner = match Arc::try_unwrap(arc_process_handle_inner) {
-            Ok(process_handler_inner) => process_handler_inner,
-            Err(_) => return Err(anyhow!("Cannot kill process because of clones")),
-        };
-        let mut child = std::mem::take(&mut process_handle_inner.child).unwrap();
-        info!(LOG_DEVIMINT, "killing {}", process_handle_inner.name);
-        kill(&child);
-        child.wait().await?;
+    pub async fn terminate(&self) -> Result<()> {
+        let mut inner = self.0.lock().await;
+        inner.terminate().await?;
         Ok(())
+    }
+    pub async fn is_running(&self) -> bool {
+        self.0.lock().await.child.is_some()
     }
 }
 
@@ -44,26 +102,78 @@ pub struct ProcessHandleInner {
     child: Option<Child>,
 }
 
-impl Drop for ProcessHandleInner {
-    fn drop(&mut self) {
-        let Some(child) = &mut self.child else { return; };
-        info!(LOG_DEVIMINT, "killing {}", self.name);
-        kill(child);
+impl ProcessHandleInner {
+    async fn terminate(&mut self) -> anyhow::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            debug!(
+                target: LOG_DEVIMINT,
+                name=%self.name,
+                signal="SIGTERM",
+                "sending signal to terminate child process"
+            );
+
+            send_sigterm(child);
+
+            if (fedimint_core::runtime::timeout(Duration::from_secs(2), child.wait()).await)
+                .is_err()
+            {
+                debug!(
+                    target: LOG_DEVIMINT,
+                    name=%self.name,
+                    signal="SIGKILL",
+                    "sending signal to terminate child process"
+                );
+
+                send_sigkill(child);
+
+                match fedimint_core::runtime::timeout(Duration::from_secs(5), child.wait()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        bail!("Failed to terminate child process {}: {}", self.name, err);
+                    }
+                    Err(_) => {
+                        bail!("Failed to terminate child process {}: timeout", self.name);
+                    }
+                }
+            }
+        }
+        // only drop the child handle if succeeded to terminate
+        self.child.take();
+        Ok(())
     }
 }
 
+impl Drop for ProcessHandleInner {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+
+        block_in_place(|| {
+            if let Err(err) = block_on(self.terminate()) {
+                warn!(target: LOG_DEVIMINT,
+                        name=%self.name,
+                        err = %err.fmt_compact_anyhow(),
+                        "Error terminating process on drop");
+            }
+        });
+    }
+}
+
+#[derive(Clone)]
 pub struct ProcessManager {
-    pub globals: vars::Global,
+    pub globals: super::vars::Global,
 }
 
 impl ProcessManager {
-    pub fn new(globals: vars::Global) -> Self {
+    pub fn new(globals: super::vars::Global) -> Self {
         Self { globals }
     }
 
     /// Logs to $FM_LOGS_DIR/{name}.{out,err}
     pub async fn spawn_daemon(&self, name: &str, mut cmd: Command) -> Result<ProcessHandle> {
-        let logs_dir = env::var("FM_LOGS_DIR")?;
+        debug!(target: LOG_DEVIMINT, %name, "Spawning daemon");
+        let logs_dir = env::var(FM_LOGS_DIR_ENV)?;
         let path = format!("{logs_dir}/{name}.log");
         let log = OpenOptions::new()
             .append(true)
@@ -79,10 +189,11 @@ impl ProcessManager {
             .cmd
             .spawn()
             .with_context(|| format!("Could not spawn: {name}"))?;
-        Ok(ProcessHandle(Arc::new(ProcessHandleInner {
+        let handle = ProcessHandle(Arc::new(Mutex::new(ProcessHandleInner {
             name: name.to_owned(),
             child: Some(child),
-        })))
+        })));
+        Ok(handle)
     }
 }
 
@@ -92,10 +203,17 @@ pub struct Command {
 }
 
 impl Command {
-    pub fn arg<T: ToString>(mut self, arg: T) -> Self {
+    pub fn arg<T: ToString>(mut self, arg: &T) -> Self {
         let string = arg.to_string();
         self.cmd.arg(string.clone());
         self.args_debug.push(string);
+        self
+    }
+
+    pub fn args<T: ToString>(mut self, args: impl IntoIterator<Item = T>) -> Self {
+        for arg in args {
+            self = self.arg(&arg);
+        }
         self
     }
 
@@ -136,22 +254,70 @@ impl Command {
             .join(" ")
     }
 
-    /// Run the command and get its output as json.
+    /// Run the command and get its output as string.
     pub async fn out_string(&mut self) -> Result<String> {
         let output = self
-            .run_inner()
+            .run_inner(true)
             .await
             .with_context(|| format!("command: {}", self.command_debug()))?;
         let output = String::from_utf8(output.stdout)?;
         Ok(output.trim().to_owned())
     }
 
-    pub async fn run_inner(&mut self) -> Result<std::process::Output> {
-        debug!(LOG_DEVIMINT, "> {}", self.command_debug());
-        let output = self.cmd.output().await?;
-        if !output.status.success() {
+    /// Returns the json error if the command has a non-zero exit code.
+    pub async fn expect_err_json(&mut self) -> Result<serde_json::Value> {
+        let output = self
+            .run_inner(false)
+            .await
+            .with_context(|| format!("command: {}", self.command_debug()))?;
+        let output = String::from_utf8(output.stdout)?;
+        Ok(serde_json::from_str(output.trim())?)
+    }
+
+    /// Run the command expecting an error, which is parsed using a closure.
+    /// Returns an Err if the closure returns false.
+    pub async fn assert_error(
+        &mut self,
+        predicate: impl Fn(serde_json::Value) -> bool,
+    ) -> Result<()> {
+        let parsed_error = self.expect_err_json().await?;
+        anyhow::ensure!(predicate(parsed_error));
+        Ok(())
+    }
+
+    /// Returns an Err if the command doesn't return an error containing the
+    /// provided error string.
+    pub async fn assert_error_contains(&mut self, error: &str) -> Result<()> {
+        self.assert_error(|err_json| {
+            let error_string = err_json
+                .get("error")
+                .expect("json error contains error field")
+                .as_str()
+                .expect("not a string")
+                .to_owned();
+
+            error_string.contains(error)
+        })
+        .await
+    }
+
+    pub async fn run_inner(&mut self, expect_success: bool) -> Result<std::process::Output> {
+        debug!(target: LOG_DEVIMINT, "> {}", self.command_debug());
+        let output = self
+            .cmd
+            .stdout(Stdio::piped())
+            .stderr(if is_env_var_set(FM_DEVIMINT_CMD_INHERIT_STDERR_ENV) {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            })
+            .spawn()?
+            .wait_with_output()
+            .await?;
+
+        if output.status.success() != expect_success {
             bail!(
-                "{}\nstdout:\n{}\nstderr:\n{}",
+                "{}\nstdout:\n{}\nstderr:\n{}\n",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
@@ -163,7 +329,7 @@ impl Command {
     /// Run the command ignoring its output.
     pub async fn run(&mut self) -> Result<()> {
         let _ = self
-            .run_inner()
+            .run_inner(true)
             .await
             .with_context(|| format!("command: {}", self.command_debug()))?;
         Ok(())
@@ -171,18 +337,24 @@ impl Command {
 
     /// Run the command logging the output and error
     pub async fn run_with_logging(&mut self, name: String) -> Result<()> {
-        let logs_dir = env::var("FM_LOGS_DIR")?;
+        let logs_dir = env::var(FM_LOGS_DIR_ENV)?;
         let path = format!("{logs_dir}/{name}.log");
         let log = OpenOptions::new()
             .append(true)
             .create(true)
-            .open(path)
-            .await?
+            .open(&path)
+            .await
+            .with_context(|| format!("path: {path} cmd: {name}"))?
             .into_std()
             .await;
         self.cmd.stdout(log.try_clone()?);
         self.cmd.stderr(log);
-        let status = self.cmd.spawn()?.wait().await?;
+        let status = self
+            .cmd
+            .spawn()
+            .with_context(|| format!("cmd: {name}"))?
+            .wait()
+            .await?;
         if !status.success() {
             bail!("{}", status);
         }
@@ -209,7 +381,7 @@ macro_rules! cmd {
             $($($tail)*)?
         }
     };
-    ($(@head ($($head:tt)* ))? $curr:expr $(, $($tail:tt)*)?) => {
+    ($(@head ($($head:tt)* ))? $curr:expr_2021 $(, $($tail:tt)*)?) => {
         cmd! {
             @head ($($($head)*)? $curr,)
             $($($tail)*)?
@@ -222,68 +394,127 @@ macro_rules! cmd {
         }
     };
     // last matcher
-    (@last $this:expr, $($arg:expr),* $(,)?) => {
+    (@last $this:expr_2021, $($arg:expr_2021),* $(,)?) => {
         {
             #[allow(unused)]
             use $crate::util::ToCmdExt;
-            $this.cmd().await
-                $(.arg($arg))*
+            $this.cmd()
+                $(.arg(&$arg))*
                 .kill_on_drop(true)
                 .env("RUST_BACKTRACE", "1")
         }
     };
 }
 
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-pub async fn poll<Fut>(name: &str, f: impl Fn() -> Fut) -> Result<()>
-where
-    Fut: Future<Output = Result<bool>>,
-{
-    poll_value(name, || async { Ok(f().await?.then_some(())) }).await?;
-    Ok(())
+#[macro_export]
+macro_rules! poll_eq {
+    ($left:expr_2021, $right:expr_2021) => {
+        match ($left, $right) {
+            (left, right) => {
+                if left == right {
+                    Ok(())
+                } else {
+                    Err(std::ops::ControlFlow::Continue(anyhow::anyhow!(
+                        "assertion failed, left: {left:?} right: {right:?}"
+                    )))
+                }
+            }
+        }
+    };
 }
 
-pub async fn poll_value<Fut, R>(name: &str, f: impl Fn() -> Fut) -> Result<R>
+// Allow macro to be used within the crate. See https://stackoverflow.com/a/31749071.
+pub(crate) use cmd;
+
+/// Retry until `f` succeeds or timeout is reached
+///
+/// - if `f` return Ok(val), this returns with Ok(val).
+/// - if `f` return Err(Control::Break(err)), this returns Err(err)
+/// - if `f` return Err(ControlFlow::Continue(err)), retries until timeout
+///   reached
+pub async fn poll_with_timeout<Fut, R>(
+    name: &str,
+    timeout: Duration,
+    f: impl Fn() -> Fut,
+) -> Result<R>
 where
-    Fut: Future<Output = Result<Option<R>>>,
+    Fut: Future<Output = Result<R, ControlFlow<anyhow::Error, anyhow::Error>>>,
 {
-    let start = fedimint_core::time::now();
-    let mut last_time = start;
-    loop {
-        if let Some(output) = f().await? {
-            break Ok(output);
+    const MIN_BACKOFF: Duration = Duration::from_millis(50);
+    const MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+    let mut backoff = custom_backoff(MIN_BACKOFF, MAX_BACKOFF, None);
+    let start = now();
+    for attempt in 0u64.. {
+        let attempt_start = now();
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(ControlFlow::Break(err)) => {
+                return Err(err).with_context(|| format!("polling {name}"));
+            }
+            Err(ControlFlow::Continue(err))
+                if attempt_start
+                    .duration_since(start)
+                    .expect("time goes forward")
+                    < timeout =>
+            {
+                debug!(target: LOG_DEVIMINT, %attempt, err = %err.fmt_compact_anyhow(), "Polling {name} failed, will retry...");
+                task::sleep(backoff.next().unwrap_or(MAX_BACKOFF)).await;
+            }
+            Err(ControlFlow::Continue(err)) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Polling {name} failed after {attempt} retries (timeout: {}s)",
+                        timeout.as_secs()
+                    )
+                });
+            }
         }
-        // report every 20 seconds
-        let now = fedimint_core::time::now();
-        if now.duration_since(last_time)? > Duration::from_secs(20) {
-            let total_duration = now.duration_since(start)?;
-            warn!(
-                LOG_DEVIMINT,
-                "waiting {name} for over {} seconds",
-                total_duration.as_secs()
-            );
-            last_time = now;
-        }
-        task::sleep(POLL_INTERVAL).await;
     }
+
+    unreachable!();
+}
+
+const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Retry until `f` succeeds or default timeout is reached
+///
+/// - if `f` return Ok(val), this returns with Ok(val).
+/// - if `f` return Err(Control::Break(err)), this returns Err(err)
+/// - if `f` return Err(ControlFlow::Continue(err)), retries until timeout
+///   reached
+pub async fn poll<Fut, R>(name: &str, f: impl Fn() -> Fut) -> Result<R>
+where
+    Fut: Future<Output = Result<R, ControlFlow<anyhow::Error, anyhow::Error>>>,
+{
+    poll_with_timeout(name, DEFAULT_POLL_TIMEOUT, f).await
+}
+
+pub async fn poll_simple<Fut, R>(name: &str, f: impl Fn() -> Fut) -> Result<R>
+where
+    Fut: Future<Output = Result<R, anyhow::Error>>,
+{
+    poll(name, || async { f().await.map_err(ControlFlow::Continue) }).await
 }
 
 // used to add `cmd` method.
 pub trait ToCmdExt {
-    type Fut;
-    fn cmd(self) -> Self::Fut;
+    fn cmd(self) -> Command;
 }
 
 // a command that uses self as program name
 impl ToCmdExt for &'_ str {
-    type Fut = std::future::Ready<Command>;
-
-    fn cmd(self) -> Self::Fut {
-        std::future::ready(Command {
+    fn cmd(self) -> Command {
+        Command {
             cmd: tokio::process::Command::new(self),
             args_debug: vec![self.to_owned()],
-        })
+        }
+    }
+}
+
+impl ToCmdExt for Vec<String> {
+    fn cmd(self) -> Command {
+        to_command(self)
     }
 }
 
@@ -294,5 +525,746 @@ pub trait JsonValueExt {
 impl JsonValueExt for serde_json::Value {
     fn to_typed<T: DeserializeOwned>(self) -> Result<T> {
         Ok(serde_json::from_value(self)?)
+    }
+}
+
+const GATEWAYD_FALLBACK: &str = "gatewayd";
+
+const FEDIMINTD_FALLBACK: &str = "fedimintd";
+
+const FEDIMINT_CLI_FALLBACK: &str = "fedimint-cli";
+
+pub fn get_fedimint_cli_path() -> Vec<String> {
+    get_command_str_for_alias(
+        &[FM_FEDIMINT_CLI_BASE_EXECUTABLE_ENV],
+        &[FEDIMINT_CLI_FALLBACK],
+    )
+}
+
+const GATEWAY_CLI_FALLBACK: &str = "gateway-cli";
+
+pub fn get_gateway_cli_path() -> Vec<String> {
+    get_command_str_for_alias(
+        &[FM_GATEWAY_CLI_BASE_EXECUTABLE_ENV],
+        &[GATEWAY_CLI_FALLBACK],
+    )
+}
+
+const LOAD_TEST_TOOL_FALLBACK: &str = "fedimint-load-test-tool";
+
+const LIGHTNING_CLI_FALLBACK: &str = "lightning-cli";
+
+pub fn get_lightning_cli_path() -> Vec<String> {
+    get_command_str_for_alias(
+        &[FM_LIGHTNING_CLI_BASE_EXECUTABLE_ENV],
+        &[LIGHTNING_CLI_FALLBACK],
+    )
+}
+
+const LNCLI_FALLBACK: &str = "lncli";
+
+pub fn get_lncli_path() -> Vec<String> {
+    get_command_str_for_alias(&[FM_LNCLI_BASE_EXECUTABLE_ENV], &[LNCLI_FALLBACK])
+}
+
+const BITCOIN_CLI_FALLBACK: &str = "bitcoin-cli";
+
+pub fn get_bitcoin_cli_path() -> Vec<String> {
+    get_command_str_for_alias(
+        &[FM_BITCOIN_CLI_BASE_EXECUTABLE_ENV],
+        &[BITCOIN_CLI_FALLBACK],
+    )
+}
+
+const BITCOIND_FALLBACK: &str = "bitcoind";
+
+const LIGHTNINGD_FALLBACK: &str = "lightningd";
+
+const LND_FALLBACK: &str = "lnd";
+
+const ELECTRS_FALLBACK: &str = "electrs";
+
+const ESPLORA_FALLBACK: &str = "esplora";
+
+const RECOVERYTOOL_FALLBACK: &str = "fedimint-recoverytool";
+
+const FAUCET_FALLBACK: &str = "devimint-faucet";
+
+const FEDIMINT_DBTOOL_FALLBACK: &str = "fedimint-dbtool";
+
+pub fn get_fedimint_dbtool_cli_path() -> Vec<String> {
+    get_command_str_for_alias(
+        &[FM_FEDIMINT_DBTOOL_BASE_EXECUTABLE_ENV],
+        &[FEDIMINT_DBTOOL_FALLBACK],
+    )
+}
+
+/// Maps a version hash to a release version
+fn version_hash_to_version(version_hash: &str) -> Result<Version> {
+    match version_hash {
+        "a8422b84102ab5fc768307215d5b20d807143f27" => Ok(Version::new(0, 2, 1)),
+        "a849377f6466b26bf9b2747242ff01fd4d4a031b" => Ok(Version::new(0, 2, 2)),
+        _ => Err(anyhow!("no version known for version hash: {version_hash}")),
+    }
+}
+
+pub struct FedimintdCmd;
+impl FedimintdCmd {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_FEDIMINTD_BASE_EXECUTABLE_ENV],
+            &[FEDIMINTD_FALLBACK],
+        ))
+    }
+
+    /// Returns the fedimintd version from clap or default min version
+    pub async fn version_or_default() -> Version {
+        match cmd!(FedimintdCmd, "--version").out_string().await {
+            Ok(version) => parse_clap_version(&version),
+            Err(_) => cmd!(FedimintdCmd, "version-hash")
+                .out_string()
+                .await
+                .map(|v| version_hash_to_version(&v).unwrap_or(DEFAULT_VERSION))
+                .unwrap_or(DEFAULT_VERSION),
+        }
+    }
+}
+
+pub struct Gatewayd;
+impl Gatewayd {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_GATEWAYD_BASE_EXECUTABLE_ENV],
+            &[GATEWAYD_FALLBACK],
+        ))
+    }
+
+    /// Returns the gatewayd version from clap or default min version
+    pub async fn version_or_default() -> Version {
+        match cmd!(Gatewayd, "--version").out_string().await {
+            Ok(version) => parse_clap_version(&version),
+            Err(_) => cmd!(Gatewayd, "version-hash")
+                .out_string()
+                .await
+                .map(|v| version_hash_to_version(&v).unwrap_or(DEFAULT_VERSION))
+                .unwrap_or(DEFAULT_VERSION),
+        }
+    }
+}
+
+pub struct FedimintCli;
+impl FedimintCli {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_MINT_CLIENT_ENV],
+            &get_fedimint_cli_path()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Returns the fedimint-cli version from clap or default min version
+    pub async fn version_or_default() -> Version {
+        match cmd!(FedimintCli, "--version").out_string().await {
+            Ok(version) => parse_clap_version(&version),
+            Err(_) => DEFAULT_VERSION,
+        }
+    }
+
+    pub async fn ws_status(self, endpoint: &str) -> Result<StatusResponse> {
+        let status = cmd!(self, "admin", "dkg", "--ws", endpoint, "ws-status")
+            .out_json()
+            .await?;
+        Ok(serde_json::from_value(status)?)
+    }
+
+    pub async fn set_password(self, auth: &ApiAuth, endpoint: &str) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "set-password",
+        )
+        .run()
+        .await
+    }
+
+    pub async fn set_local_params_leader(
+        self,
+        peer: &PeerId,
+        auth: &ApiAuth,
+        endpoint: &str,
+    ) -> Result<String> {
+        let json = cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "config-gen",
+            "--ws",
+            endpoint,
+            "set-local-params",
+            format!("Devimint Guardian {peer}"),
+            "--federation-name",
+            "Devimint Federation"
+        )
+        .out_json()
+        .await?;
+
+        Ok(serde_json::from_value(json)?)
+    }
+
+    pub async fn set_local_params_follower(
+        self,
+        peer: &PeerId,
+        auth: &ApiAuth,
+        endpoint: &str,
+    ) -> Result<String> {
+        let json = cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "config-gen",
+            "--ws",
+            endpoint,
+            "set-local-params",
+            format!("Devimint Guardian {peer}")
+        )
+        .out_json()
+        .await?;
+
+        Ok(serde_json::from_value(json)?)
+    }
+
+    pub async fn add_peer_connection_info(
+        self,
+        params: &str,
+        auth: &ApiAuth,
+        endpoint: &str,
+    ) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "config-gen",
+            "--ws",
+            endpoint,
+            "add-peer-connection-info",
+            params
+        )
+        .run()
+        .await
+    }
+
+    pub async fn server_status(self, auth: &ApiAuth, endpoint: &str) -> Result<ServerStatus> {
+        let json = cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "config-gen",
+            "--ws",
+            endpoint,
+            "server-status",
+        )
+        .out_json()
+        .await?;
+
+        Ok(serde_json::from_value(json)?)
+    }
+
+    pub async fn start_dkg(self, auth: &ApiAuth, endpoint: &str) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "config-gen",
+            "--ws",
+            endpoint,
+            "start-dkg"
+        )
+        .run()
+        .await
+    }
+
+    pub async fn set_config_gen_params(
+        self,
+        auth: &ApiAuth,
+        endpoint: &str,
+        meta: BTreeMap<String, String>,
+        server_gen_params: ServerModuleConfigGenParamsRegistry,
+    ) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "set-config-gen-params",
+            "--meta-json",
+            serde_json::to_string(&meta)?,
+            "--modules-json",
+            serde_json::to_string(&server_gen_params)?
+        )
+        .run()
+        .await
+    }
+
+    pub async fn consensus_config_gen_params_legacy(
+        self,
+        endpoint: &str,
+    ) -> Result<ConfigGenParamsResponseLegacy> {
+        let result = cmd!(
+            self,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "consensus-config-gen-params"
+        )
+        .out_json()
+        .await
+        .context("non-json returned for consensus_config_gen_params")?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    pub async fn set_config_gen_connections(
+        self,
+        auth: &ApiAuth,
+        endpoint: &str,
+        our_name: &str,
+        leader_api_url: Option<&str>,
+    ) -> Result<()> {
+        // FIXME: this should be a single command
+        if let Some(leader_api_url) = leader_api_url {
+            cmd!(
+                self,
+                "--password",
+                &auth.0,
+                "admin",
+                "dkg",
+                "--ws",
+                endpoint,
+                "set-config-gen-connections",
+                "--our-name",
+                our_name,
+                "--leader-api-url",
+                leader_api_url,
+            )
+            .run()
+            .await
+        } else {
+            cmd!(
+                self,
+                "--password",
+                &auth.0,
+                "admin",
+                "dkg",
+                "--ws",
+                endpoint,
+                "set-config-gen-connections",
+                "--our-name",
+                our_name,
+            )
+            .run()
+            .await
+        }
+    }
+
+    pub async fn get_config_gen_peers(self, endpoint: &str) -> Result<Vec<PeerServerParams>> {
+        let result = cmd!(
+            self,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "get-config-gen-peers"
+        )
+        .out_json()
+        .await
+        .context("non-json returned for get_config_gen_peers")?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    pub async fn run_dkg(self, auth: &ApiAuth, endpoint: &str) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "run-dkg"
+        )
+        .run()
+        .await
+    }
+
+    pub async fn get_verify_config_hash(
+        self,
+        auth: &ApiAuth,
+        endpoint: &str,
+    ) -> Result<BTreeMap<PeerId, bitcoincore_rpc::bitcoin::hashes::sha256::Hash>> {
+        let result = cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "get-verify-config-hash"
+        )
+        .out_json()
+        .await
+        .context("non-json returned for get_verify_config_hash")?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    pub async fn shutdown(self, auth: &ApiAuth, our_id: u64, session_count: u64) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "--our-id",
+            our_id,
+            "admin",
+            "shutdown",
+            session_count,
+        )
+        .run()
+        .await
+    }
+
+    pub async fn status(self, auth: &ApiAuth, our_id: u64) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "--our-id",
+            our_id,
+            "admin",
+            "status",
+        )
+        .run()
+        .await
+    }
+
+    pub async fn start_consensus(self, auth: &ApiAuth, endpoint: &str) -> Result<()> {
+        cmd!(
+            self,
+            "--password",
+            &auth.0,
+            "admin",
+            "dkg",
+            "--ws",
+            endpoint,
+            "start-consensus"
+        )
+        .run()
+        .await
+    }
+}
+
+pub struct LoadTestTool;
+impl LoadTestTool {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_LOAD_TEST_TOOL_BASE_EXECUTABLE_ENV],
+            &[LOAD_TEST_TOOL_FALLBACK],
+        ))
+    }
+}
+
+pub struct GatewayCli;
+impl GatewayCli {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_GATEWAY_CLI_BASE_EXECUTABLE_ENV],
+            &get_gateway_cli_path()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Returns the gateway-cli version from clap or default min version
+    pub async fn version_or_default() -> Version {
+        match cmd!(GatewayCli, "--version").out_string().await {
+            Ok(version) => parse_clap_version(&version),
+            Err(_) => DEFAULT_VERSION,
+        }
+    }
+}
+
+pub struct GatewayLndCli;
+impl GatewayLndCli {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_GWCLI_LND_ENV],
+            &["gateway-lnd"],
+        ))
+    }
+}
+
+pub struct LnCli;
+impl LnCli {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_LNCLI_ENV],
+            &get_lncli_path()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+pub struct ClnLightningCli;
+impl ClnLightningCli {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_LIGHTNING_CLI_ENV],
+            &get_lightning_cli_path()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+pub struct BitcoinCli;
+impl BitcoinCli {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_BTC_CLIENT_ENV],
+            &get_bitcoin_cli_path()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+pub struct Bitcoind;
+impl Bitcoind {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_BITCOIND_BASE_EXECUTABLE_ENV],
+            &[BITCOIND_FALLBACK],
+        ))
+    }
+}
+
+pub struct Lightningd;
+impl Lightningd {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_LIGHTNINGD_BASE_EXECUTABLE_ENV],
+            &[LIGHTNINGD_FALLBACK],
+        ))
+    }
+}
+
+pub struct Lnd;
+impl Lnd {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_LND_BASE_EXECUTABLE_ENV],
+            &[LND_FALLBACK],
+        ))
+    }
+}
+
+pub struct Electrs;
+impl Electrs {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_ELECTRS_BASE_EXECUTABLE_ENV],
+            &[ELECTRS_FALLBACK],
+        ))
+    }
+}
+
+pub struct Esplora;
+impl Esplora {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_ESPLORA_BASE_EXECUTABLE_ENV],
+            &[ESPLORA_FALLBACK],
+        ))
+    }
+}
+
+pub struct Recoverytool;
+impl Recoverytool {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_RECOVERYTOOL_BASE_EXECUTABLE_ENV],
+            &[RECOVERYTOOL_FALLBACK],
+        ))
+    }
+}
+
+pub struct Faucet;
+impl Faucet {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_FAUCET_BASE_EXECUTABLE_ENV],
+            &[FAUCET_FALLBACK],
+        ))
+    }
+}
+
+fn get_command_str_for_alias(aliases: &[&str], default: &[&str]) -> Vec<String> {
+    // try to use one of the aliases if set
+    for alias in aliases {
+        if let Ok(cmd) = std::env::var(alias) {
+            return cmd.split_whitespace().map(ToOwned::to_owned).collect();
+        }
+    }
+    // otherwise return the default value
+    default.iter().map(ToString::to_string).collect()
+}
+
+fn to_command(cli: Vec<String>) -> Command {
+    let mut cmd = tokio::process::Command::new(&cli[0]);
+    cmd.args(&cli[1..]);
+    Command {
+        cmd,
+        args_debug: cli,
+    }
+}
+
+pub fn supports_lnv2() -> bool {
+    is_env_var_set(FM_ENABLE_MODULE_LNV2_ENV)
+}
+
+/// Returns true if running backwards-compatibility tests
+pub fn is_backwards_compatibility_test() -> bool {
+    is_env_var_set(FM_BACKWARDS_COMPATIBILITY_TEST_ENV)
+}
+
+/// Sets the fedimint-cli binary to match the fedimintd's version, which is
+/// needed for running DKG. Returns the original fedimint-cli path and mint
+/// client alias so the caller can reset the fedimint-cli version after DKG
+pub async fn use_matching_fedimint_cli_for_dkg() -> Result<(String, String)> {
+    let pkg_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let fedimintd_version = crate::util::FedimintdCmd::version_or_default().await;
+    let original_fedimint_cli_path = crate::util::get_fedimint_cli_path().join(" ");
+
+    if pkg_version == fedimintd_version {
+        // we're on the current version if the fedimintd version is the same as the
+        // package version. to use the current version of `fedimint-cli` built by cargo,
+        // we need to unset FM_FEDIMINT_CLI_BASE_EXECUTABLE
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(FM_FEDIMINT_CLI_BASE_EXECUTABLE_ENV) };
+    } else {
+        let parsed_fedimintd_version = fedimintd_version.to_string().replace(['-', '.'], "_");
+
+        // matches format defined by nix_binary_version_var_name in scripts/_common.sh
+        let fedimint_cli_path_var = format!("fm_bin_fedimint_cli_v{parsed_fedimintd_version}");
+        let fedimint_cli_path = std::env::var(fedimint_cli_path_var)?;
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(FM_FEDIMINT_CLI_BASE_EXECUTABLE_ENV, fedimint_cli_path) };
+    }
+
+    let original_fm_mint_client = std::env::var(FM_MINT_CLIENT_ENV)?;
+    let fm_client_dir = std::env::var(FM_CLIENT_DIR_ENV)?;
+    let fm_client_dir_path_buf: PathBuf = PathBuf::from(fm_client_dir);
+
+    let fm_mint_client: String = format!(
+        "{fedimint_cli} --data-dir {datadir}",
+        fedimint_cli = crate::util::get_fedimint_cli_path().join(" "),
+        datadir = crate::vars::utf8(&fm_client_dir_path_buf)
+    );
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(FM_MINT_CLIENT_ENV, fm_mint_client) };
+
+    Ok((original_fedimint_cli_path, original_fm_mint_client))
+}
+
+/// Sets the fedimint-cli and mint client alias
+pub fn use_fedimint_cli(original_fedimint_cli_path: String, original_fm_mint_client: String) {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            FM_FEDIMINT_CLI_BASE_EXECUTABLE_ENV,
+            original_fedimint_cli_path,
+        );
+    };
+
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(FM_MINT_CLIENT_ENV, original_fm_mint_client) };
+}
+
+/// Parses a version string returned from clap
+/// ex: fedimintd 0.3.0-alpha -> 0.3.0-alpha
+fn parse_clap_version(res: &str) -> Version {
+    match res.split(' ').collect::<Vec<&str>>().as_slice() {
+        [_binary, version] => Version::parse(version).unwrap_or(DEFAULT_VERSION),
+        _ => DEFAULT_VERSION,
+    }
+}
+
+#[test]
+fn test_parse_clap_version() -> Result<()> {
+    let version_str = "fedimintd 0.3.0-alpha";
+    let expected_version = Version::parse("0.3.0-alpha")?;
+    assert_eq!(expected_version, parse_clap_version(version_str));
+
+    let version_str = "fedimintd 0.3.12";
+    let expected_version = Version::parse("0.3.12")?;
+    assert_eq!(expected_version, parse_clap_version(version_str));
+
+    let version_str = "fedimint-cli 2.12.2-rc22";
+    let expected_version = Version::parse("2.12.2-rc22")?;
+    assert_eq!(expected_version, parse_clap_version(version_str));
+
+    let version_str = "bad version";
+    let expected_version = DEFAULT_VERSION;
+    assert_eq!(expected_version, parse_clap_version(version_str));
+
+    Ok(())
+}
+
+mod legacy_types {
+    use std::collections::BTreeMap;
+
+    use fedimint_core::PeerId;
+    use fedimint_core::admin_client::PeerServerParams;
+    use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
+    use serde::{Deserialize, Serialize};
+
+    /// The config gen params that need to be in consensus, sent by the config
+    /// gen leader to all the other guardians
+    #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+    pub struct ConfigGenParamsConsensusLegacy {
+        /// Endpoints of all servers
+        pub peers: BTreeMap<PeerId, PeerServerParams>,
+        /// Guardian-defined key-value pairs that will be passed to the client
+        pub meta: BTreeMap<String, String>,
+        /// Module init params (also contains local params from us)
+        pub modules: ServerModuleConfigGenParamsRegistry,
+    }
+
+    /// The config gen params response which includes our peer id
+    #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+    pub struct ConfigGenParamsResponseLegacy {
+        /// The same for all peers
+        pub consensus: ConfigGenParamsConsensusLegacy,
+        /// Our id (might change if new peers join)
+        pub our_current_id: PeerId,
     }
 }

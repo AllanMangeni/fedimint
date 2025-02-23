@@ -1,0 +1,13 @@
+[package]
+name = "fedimint-docs"
+edition = { workspace = true }
+authors = { workspace = true }
+version = { workspace = true }
+publish = false
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
+
+[lib]
+name = "fedimint_docs"
+path = "lib.rs"

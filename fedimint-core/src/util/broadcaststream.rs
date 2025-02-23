@@ -3,9 +3,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::{ready, Stream};
-use tokio::sync::broadcast::error::RecvError;
+use futures::{Stream, ready};
 use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::task::MaybeSend;
 use crate::util::BoxFuture;
@@ -15,7 +15,6 @@ use crate::util::BoxFuture;
 ///
 /// [`tokio::sync::broadcast::Receiver`]: struct@tokio::sync::broadcast::Receiver
 /// [`Stream`]: trait@futures::Stream
-#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub struct BroadcastStream<T> {
     inner: BoxFuture<'static, (Result<T, RecvError>, Receiver<T>)>,
 }
@@ -33,7 +32,7 @@ pub enum BroadcastStreamRecvError {
 impl fmt::Display for BroadcastStreamRecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BroadcastStreamRecvError::Lagged(amt) => write!(f, "channel lagged by {amt}"),
+            Self::Lagged(amt) => write!(f, "channel lagged by {amt}"),
         }
     }
 }

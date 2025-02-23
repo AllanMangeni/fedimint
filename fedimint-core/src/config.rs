@@ -5,33 +5,36 @@ use std::ops::Mul;
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{bail, format_err};
-use bitcoin::secp256k1;
-use bitcoin_hashes::hex::{format_hex, FromHex};
-use bitcoin_hashes::sha256::{Hash as Sha256, HashEngine};
-use bitcoin_hashes::{hex, sha256};
-use fedimint_core::cancellable::Cancelled;
+use anyhow::{Context, bail, format_err};
+use bitcoin::hashes::sha256::{Hash as Sha256, HashEngine};
+use bitcoin::hashes::{Hash as BitcoinHash, hex, sha256};
+use bls12_381::Scalar;
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
-use fedimint_core::encoding::Encodable;
-use fedimint_core::epoch::SerdeSignature;
+use fedimint_core::encoding::{DynRawFallback, Encodable};
 use fedimint_core::module::registry::ModuleRegistry;
-use fedimint_core::{BitcoinHash, ModuleDecoderRegistry};
+use fedimint_core::util::SafeUrl;
+use fedimint_core::{ModuleDecoderRegistry, format_hex};
+use fedimint_logging::LOG_CORE;
+use hex::FromHex;
+use secp256k1::PublicKey;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tbs::{serde_impl, Scalar};
-use thiserror::Error;
+use serde_json::json;
 use threshold_crypto::group::{Curve, Group, GroupEncoding};
 use threshold_crypto::{G1Projective, G2Projective};
-use url::Url;
+use tracing::warn;
 
+use crate::core::DynClientConfig;
 use crate::encoding::Decodable;
 use crate::module::{
-    CoreConsensusVersion, DynCommonModuleGen, DynServerModuleGen, IDynCommonModuleGen,
-    ModuleConsensusVersion,
+    CoreConsensusVersion, DynCommonModuleInit, IDynCommonModuleInit, ModuleConsensusVersion,
 };
-use crate::task::{MaybeSend, MaybeSync};
-use crate::{maybe_add_send_sync, PeerId};
+use crate::{PeerId, bls12_381_serde, maybe_add_send_sync};
+
+// TODO: make configurable
+/// This limits the RAM consumption of a AlephBFT Unit to roughly 50kB
+pub const ALEPH_BFT_UNIT_BYTE_LIMIT: usize = 50_000;
 
 /// [`serde_json::Value`] that must contain `kind: String` field
 ///
@@ -99,9 +102,20 @@ impl JsonWithKind {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct PeerUrl {
     /// The peer's public URL (e.g. `wss://fedimint-server-1:5000`)
-    pub url: Url,
+    pub url: SafeUrl,
     /// The peer's name
     pub name: String,
+}
+
+/// Total client config v0 (<0.4.0). Does not contain broadcast public keys.
+///
+/// This includes global settings and client-side module configs.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct ClientConfigV0 {
+    #[serde(flatten)]
+    pub global: GlobalClientConfigV0,
+    #[serde(deserialize_with = "de_int_key")]
+    pub modules: BTreeMap<ModuleInstanceId, ClientModuleConfig>,
 }
 
 /// Total client config
@@ -109,28 +123,185 @@ pub struct PeerUrl {
 /// This includes global settings and client-side module configs.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct ClientConfig {
-    // Stable and unique id and threshold pubkey of the federation for authenticating configs
-    pub federation_id: FederationId,
+    #[serde(flatten)]
+    pub global: GlobalClientConfig,
+    #[serde(deserialize_with = "de_int_key")]
+    pub modules: BTreeMap<ModuleInstanceId, ClientModuleConfig>,
+}
+
+// FIXME: workaround for https://github.com/serde-rs/json/issues/989
+fn de_int_key<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Eq + Ord + FromStr,
+    K::Err: Display,
+    V: Deserialize<'de>,
+{
+    let string_map = <BTreeMap<String, V>>::deserialize(deserializer)?;
+    let map = string_map
+        .into_iter()
+        .map(|(key_str, value)| {
+            let key = K::from_str(&key_str).map_err(serde::de::Error::custom)?;
+            Ok((key, value))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(map)
+}
+
+fn optional_de_int_key<'de, D, K, V>(deserializer: D) -> Result<Option<BTreeMap<K, V>>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Eq + Ord + FromStr,
+    K::Err: Display,
+    V: Deserialize<'de>,
+{
+    let Some(string_map) = <Option<BTreeMap<String, V>>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    let map = string_map
+        .into_iter()
+        .map(|(key_str, value)| {
+            let key = K::from_str(&key_str).map_err(serde::de::Error::custom)?;
+            Ok((key, value))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+    Ok(Some(map))
+}
+
+/// Client config that cannot be cryptographically verified but is easier to
+/// parse by external tools
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JsonClientConfig {
+    pub global: GlobalClientConfig,
+    pub modules: BTreeMap<ModuleInstanceId, JsonWithKind>,
+}
+
+/// Federation-wide client config
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct GlobalClientConfigV0 {
     /// API endpoints for each federation member
+    #[serde(deserialize_with = "de_int_key")]
     pub api_endpoints: BTreeMap<PeerId, PeerUrl>,
-    /// Threshold pubkey for authenticating epoch history
-    pub epoch_pk: threshold_crypto::PublicKey,
     /// Core consensus version
     pub consensus_version: CoreConsensusVersion,
     // TODO: make it a String -> serde_json::Value map?
     /// Additional config the federation wants to transmit to the clients
     pub meta: BTreeMap<String, String>,
-    /// Configs from other client modules
-    pub modules: BTreeMap<ModuleInstanceId, ClientModuleConfig>,
 }
 
-/// The API response for client config requests, signed by the Federation
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClientConfigResponse {
-    /// The client config
-    pub client_config: ClientConfig,
-    /// Auth key signature over the `client_config`
-    pub signature: SerdeSignature,
+/// Federation-wide client config
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct GlobalClientConfig {
+    /// API endpoints for each federation member
+    #[serde(deserialize_with = "de_int_key")]
+    pub api_endpoints: BTreeMap<PeerId, PeerUrl>,
+    /// Signing session keys for each federation member
+    /// Optional for 0.3.x backwards compatibility
+    #[serde(default, deserialize_with = "optional_de_int_key")]
+    pub broadcast_public_keys: Option<BTreeMap<PeerId, PublicKey>>,
+    /// Core consensus version
+    pub consensus_version: CoreConsensusVersion,
+    // TODO: make it a String -> serde_json::Value map?
+    /// Additional config the federation wants to transmit to the clients
+    pub meta: BTreeMap<String, String>,
+}
+
+impl GlobalClientConfig {
+    /// 0.4.0 and later uses a hash of broadcast public keys to calculate the
+    /// federation id. 0.3.x and earlier use a hash of api endpoints
+    pub fn calculate_federation_id(&self) -> FederationId {
+        FederationId(self.api_endpoints.consensus_hash())
+    }
+
+    /// Federation name from config metadata (if set)
+    pub fn federation_name(&self) -> Option<&str> {
+        self.meta.get(META_FEDERATION_NAME_KEY).map(|x| &**x)
+    }
+}
+
+impl ClientConfig {
+    /// See [`DynRawFallback::redecode_raw`].
+    pub fn redecode_raw(
+        self,
+        modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, crate::encoding::DecodeError> {
+        Ok(Self {
+            modules: self
+                .modules
+                .into_iter()
+                .map(|(k, v)| {
+                    // Assuming this isn't running in any hot path it's better to have the debug
+                    // info than saving one allocation
+                    let kind = v.kind.clone();
+                    v.redecode_raw(modules)
+                        .context(format!("redecode_raw: instance: {k}, kind: {kind}"))
+                        .map(|v| (k, v))
+                })
+                .collect::<Result<_, _>>()?,
+            ..self
+        })
+    }
+
+    pub fn calculate_federation_id(&self) -> FederationId {
+        self.global.calculate_federation_id()
+    }
+
+    /// Get the value of a given meta field
+    pub fn meta<V: serde::de::DeserializeOwned + 'static>(
+        &self,
+        key: &str,
+    ) -> Result<Option<V>, anyhow::Error> {
+        let Some(str_value) = self.global.meta.get(key) else {
+            return Ok(None);
+        };
+        let res = serde_json::from_str(str_value)
+            .map(Some)
+            .context(format!("Decoding meta field '{key}' failed"));
+
+        // In the past we encoded some string fields as "just a string" without quotes,
+        // this code ensures that old meta values still parse since config is hard to
+        // change
+        if res.is_err() && std::any::TypeId::of::<V>() == std::any::TypeId::of::<String>() {
+            let string_ret = Box::new(str_value.clone());
+            let ret = unsafe {
+                // We can transmute a String to V because we know that V==String
+                std::mem::transmute::<Box<String>, Box<V>>(string_ret)
+            };
+            Ok(Some(*ret))
+        } else {
+            res
+        }
+    }
+
+    /// Converts a consensus-encoded client config struct to a client config
+    /// struct that when encoded as JSON shows the fields of module configs
+    /// instead of a consensus-encoded hex string.
+    ///
+    /// In case of unknown module the config value is a hex string.
+    pub fn to_json(&self) -> JsonClientConfig {
+        JsonClientConfig {
+            global: self.global.clone(),
+            modules: self
+                .modules
+                .iter()
+                .map(|(&module_instance_id, module_config)| {
+                    let module_config_json = JsonWithKind {
+                        kind: module_config.kind.clone(),
+                        value: module_config.config
+                            .clone()
+                            .decoded()
+                            .and_then(|dyn_cfg| dyn_cfg.to_json())
+                            .unwrap_or_else(|| json!({
+                            "unknown_module_hex": module_config.config.consensus_encode_to_hex()
+                        })),
+                    };
+                    (module_instance_id, module_config_json)
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The federation id is a copy of the authentication threshold public key of
@@ -152,11 +323,52 @@ pub struct ClientConfigResponse {
     Ord,
     PartialOrd,
 )]
-pub struct FederationId(pub threshold_crypto::PublicKey);
+pub struct FederationId(pub sha256::Hash);
+
+#[derive(
+    Debug,
+    Copy,
+    Serialize,
+    Deserialize,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Encodable,
+    Decodable,
+    Ord,
+    PartialOrd,
+)]
+/// Prefix of the [`FederationId`], useful for UX improvements
+///
+/// Intentionally compact to save on the encoding. With 4 billion
+/// combinations real-life non-malicious collisions should never
+/// happen.
+pub struct FederationIdPrefix([u8; 4]);
+
+impl Display for FederationIdPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        format_hex(&self.0, f)
+    }
+}
 
 impl Display for FederationId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        format_hex(&self.0.to_bytes(), f)
+        format_hex(&self.0.to_byte_array(), f)
+    }
+}
+
+impl FromStr for FederationIdPrefix {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(<[u8; 4]>::from_hex(s)?))
+    }
+}
+
+impl FederationIdPrefix {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_vec()
     }
 }
 
@@ -164,12 +376,15 @@ impl Display for FederationId {
 impl FederationId {
     /// Random dummy id for testing
     pub fn dummy() -> Self {
-        let rand_pk = threshold_crypto::SecretKey::random().public_key();
-        Self(rand_pk)
+        Self(sha256::Hash::from_byte_array([42; 32]))
     }
 
-    fn try_from_bytes(bytes: [u8; 48]) -> Option<Self> {
-        Some(Self(threshold_crypto::PublicKey::from_bytes(bytes).ok()?))
+    pub(crate) fn from_byte_array(bytes: [u8; 32]) -> Self {
+        Self(sha256::Hash::from_byte_array(bytes))
+    }
+
+    pub fn to_prefix(&self) -> FederationIdPrefix {
+        FederationIdPrefix(self.0[..4].try_into().expect("can't fail"))
     }
 
     /// Converts a federation id to a public key to which we know but discard
@@ -183,11 +398,10 @@ impl FederationId {
     /// other LN senders will know that they cannot pay the invoice.
     pub fn to_fake_ln_pub_key(
         &self,
-        secp: &secp256k1::Secp256k1<secp256k1_zkp::All>,
-    ) -> anyhow::Result<secp256k1::PublicKey> {
-        let bytes = <Sha256 as bitcoin_hashes::Hash>::hash(&self.0.to_bytes()[..]);
-        let sk = secp256k1::SecretKey::from_slice(&bytes)?;
-        Ok(secp256k1::PublicKey::from_secret_key(secp, &sk))
+        secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    ) -> anyhow::Result<bitcoin::secp256k1::PublicKey> {
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&self.0.to_byte_array())?;
+        Ok(bitcoin::secp256k1::PublicKey::from_secret_key(secp, &sk))
     }
 }
 
@@ -195,12 +409,7 @@ impl FromStr for FederationId {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_from_bytes(
-            Vec::from_hex(s)?
-                .try_into()
-                .map_err(|bytes: Vec<u8>| hex::Error::InvalidLength(48, bytes.len()))?,
-        )
-        .ok_or_else::<anyhow::Error, _>(|| format_err!("Invalid FederationId pubkey"))
+        Ok(Self::from_byte_array(<[u8; 32]>::from_hex(s)?))
     }
 }
 
@@ -213,24 +422,19 @@ impl ClientConfig {
         sha256::Hash::from_engine(engine)
     }
 
-    pub fn get_module<T: Decodable>(&self, id: ModuleInstanceId) -> anyhow::Result<T> {
-        if let Some(client_cfg) = self.modules.get(&id) {
-            Ok(Decodable::consensus_decode(
-                &mut &client_cfg.config[..],
-                &Default::default(),
-            )?)
-        } else {
-            Err(format_err!("Client config for module id {id} not found"))
-        }
+    pub fn get_module<T: Decodable + 'static>(&self, id: ModuleInstanceId) -> anyhow::Result<&T> {
+        self.modules.get(&id).map_or_else(
+            || Err(format_err!("Client config for module id {id} not found")),
+            |client_cfg| client_cfg.cast(),
+        )
     }
 
     // TODO: rename this and one above
     pub fn get_module_cfg(&self, id: ModuleInstanceId) -> anyhow::Result<ClientModuleConfig> {
-        if let Some(client_cfg) = self.modules.get(&id) {
-            Ok(client_cfg.clone())
-        } else {
-            Err(format_err!("Client config for module id {id} not found"))
-        }
+        self.modules.get(&id).map_or_else(
+            || Err(format_err!("Client config for module id {id} not found")),
+            |client_cfg| Ok(client_cfg.clone()),
+        )
     }
 
     /// (soft-deprecated): Get the first instance of a module of a given kind in
@@ -240,18 +444,15 @@ impl ClientConfig {
     /// mint, wallet, ln module code in the client, this is useful, but
     /// please write any new code that avoids assumptions about available
     /// modules.
-    pub fn get_first_module_by_kind<T: Decodable>(
+    pub fn get_first_module_by_kind<T: Decodable + 'static>(
         &self,
         kind: impl Into<ModuleKind>,
-    ) -> anyhow::Result<(ModuleInstanceId, T)> {
+    ) -> anyhow::Result<(ModuleInstanceId, &T)> {
         let kind: ModuleKind = kind.into();
         let Some((id, module_cfg)) = self.modules.iter().find(|(_, v)| v.is_kind(&kind)) else {
             anyhow::bail!("Module kind {kind} not found")
         };
-        Ok((
-            *id,
-            T::consensus_decode(&mut &module_cfg.config[..], &Default::default())?,
-        ))
+        Ok((*id, module_cfg.cast()?))
     }
 
     // TODO: rename this and above
@@ -266,82 +467,76 @@ impl ClientConfig {
             .map(|(id, v)| (*id, v.clone()))
             .ok_or_else(|| anyhow::format_err!("Module kind {kind} not found"))
     }
-
-    /// Federation name from config metadata (if set)
-    pub fn federation_name(&self) -> Option<&str> {
-        self.meta.get(META_FEDERATION_NAME_KEY).map(|x| &**x)
-    }
 }
 
 #[derive(Clone, Debug)]
-pub struct ModuleGenRegistry<M>(BTreeMap<ModuleKind, M>);
+pub struct ModuleInitRegistry<M>(BTreeMap<ModuleKind, M>);
 
-impl<M> Default for ModuleGenRegistry<M> {
-    fn default() -> Self {
-        Self(Default::default())
+impl<M> ModuleInitRegistry<M> {
+    pub fn iter(&self) -> impl Iterator<Item = (&ModuleKind, &M)> {
+        self.0.iter()
     }
 }
 
-/// Type erased `ModuleGenParams` used to generate the `ServerModuleConfig`
+impl<M> Default for ModuleInitRegistry<M> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+/// Type erased `ModuleInitParams` used to generate the `ServerModuleConfig`
 /// during config gen
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConfigGenModuleParams {
-    pub local: Option<serde_json::Value>,
-    pub consensus: Option<serde_json::Value>,
+    pub local: serde_json::Value,
+    pub consensus: serde_json::Value,
 }
 
-pub type ServerModuleGenRegistry = ModuleGenRegistry<DynServerModuleGen>;
-
 impl ConfigGenModuleParams {
-    pub fn new(local: Option<serde_json::Value>, consensus: Option<serde_json::Value>) -> Self {
+    pub fn new(local: serde_json::Value, consensus: serde_json::Value) -> Self {
         Self { local, consensus }
     }
 
     /// Converts the JSON into typed version, errors unless both `local` and
     /// `consensus` values are defined
-    pub fn to_typed<P: ModuleGenParams>(&self) -> anyhow::Result<P> {
+    pub fn to_typed<P: ModuleInitParams>(&self) -> anyhow::Result<P> {
         Ok(P::from_parts(
             Self::parse("local", self.local.clone())?,
             Self::parse("consensus", self.consensus.clone())?,
         ))
     }
 
-    fn parse<P: DeserializeOwned>(
-        name: &str,
-        json: Option<serde_json::Value>,
-    ) -> anyhow::Result<P> {
-        let json = json.ok_or(format_err!("{name} config gen params missing"))?;
-        serde_json::from_value(json)
-            .map_err(|e| anyhow::Error::new(e).context("Invalid module params"))
+    fn parse<P: DeserializeOwned>(name: &str, json: serde_json::Value) -> anyhow::Result<P> {
+        serde_json::from_value(json).with_context(|| format!("Schema mismatch for {name} argument"))
     }
 
-    pub fn from_typed<P: ModuleGenParams>(p: P) -> anyhow::Result<Self> {
+    pub fn from_typed<P: ModuleInitParams>(p: P) -> anyhow::Result<Self> {
         let (local, consensus) = p.to_parts();
         Ok(Self {
-            local: Some(serde_json::to_value(local)?),
-            consensus: Some(serde_json::to_value(consensus)?),
+            local: serde_json::to_value(local)?,
+            consensus: serde_json::to_value(consensus)?,
         })
     }
 }
 
-pub type CommonModuleGenRegistry = ModuleGenRegistry<DynCommonModuleGen>;
+pub type CommonModuleInitRegistry = ModuleInitRegistry<DynCommonModuleInit>;
 
 /// Registry that contains the config gen params for all modules
-pub type ServerModuleGenParamsRegistry = ModuleRegistry<ConfigGenModuleParams>;
+pub type ServerModuleConfigGenParamsRegistry = ModuleRegistry<ConfigGenModuleParams>;
 
-impl Eq for ServerModuleGenParamsRegistry {}
+impl Eq for ServerModuleConfigGenParamsRegistry {}
 
-impl PartialEq for ServerModuleGenParamsRegistry {
+impl PartialEq for ServerModuleConfigGenParamsRegistry {
     fn eq(&self, other: &Self) -> bool {
         self.iter_modules().eq(other.iter_modules())
     }
 }
 
-impl Serialize for ServerModuleGenParamsRegistry {
+impl Serialize for ServerModuleConfigGenParamsRegistry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let modules: Vec<_> = self.iter_modules().collect();
         let mut serializer = serializer.serialize_map(Some(modules.len()))?;
-        for (id, kind, params) in modules.into_iter() {
+        for (id, kind, params) in modules {
             serializer.serialize_key(&id)?;
             serializer.serialize_value(&(kind.clone(), params.clone()))?;
         }
@@ -349,7 +544,7 @@ impl Serialize for ServerModuleGenParamsRegistry {
     }
 }
 
-impl<'de> Deserialize<'de> for ServerModuleGenParamsRegistry {
+impl<'de> Deserialize<'de> for ServerModuleConfigGenParamsRegistry {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -361,47 +556,53 @@ impl<'de> Deserialize<'de> for ServerModuleGenParamsRegistry {
         for (id, (kind, module)) in json {
             params.insert(id, (kind, module));
         }
-        Ok(ModuleRegistry::from(params))
+        Ok(Self::from(params))
     }
 }
 
-impl<M> From<Vec<M>> for ModuleGenRegistry<M>
+impl<M> From<Vec<M>> for ModuleInitRegistry<M>
 where
-    M: AsRef<dyn IDynCommonModuleGen + Send + Sync + 'static>,
+    M: AsRef<dyn IDynCommonModuleInit + Send + Sync + 'static>,
 {
     fn from(value: Vec<M>) -> Self {
-        Self(BTreeMap::from_iter(
-            value.into_iter().map(|i| (i.as_ref().module_kind(), i)),
-        ))
+        Self(
+            value
+                .into_iter()
+                .map(|i| (i.as_ref().module_kind(), i))
+                .collect::<BTreeMap<_, _>>(),
+        )
     }
 }
 
-impl<M> FromIterator<M> for ModuleGenRegistry<M>
+impl<M> FromIterator<M> for ModuleInitRegistry<M>
 where
-    M: AsRef<maybe_add_send_sync!(dyn IDynCommonModuleGen + 'static)>,
+    M: AsRef<maybe_add_send_sync!(dyn IDynCommonModuleInit + 'static)>,
 {
     fn from_iter<T: IntoIterator<Item = M>>(iter: T) -> Self {
-        Self(BTreeMap::from_iter(
-            iter.into_iter().map(|i| (i.as_ref().module_kind(), i)),
-        ))
+        Self(
+            iter.into_iter()
+                .map(|i| (i.as_ref().module_kind(), i))
+                .collect::<BTreeMap<_, _>>(),
+        )
     }
 }
 
-impl<M> ModuleGenRegistry<M> {
+impl<M> ModuleInitRegistry<M> {
     pub fn new() -> Self {
-        Default::default()
+        Self::default()
     }
 
-    pub fn attach<T>(&mut self, gen: T)
+    pub fn attach<T>(&mut self, r#gen: T)
     where
         T: Into<M> + 'static + Send + Sync,
-        M: AsRef<dyn IDynCommonModuleGen + 'static + Send + Sync>,
+        M: AsRef<dyn IDynCommonModuleInit + 'static + Send + Sync>,
     {
-        let gen: M = gen.into();
-        let kind = gen.as_ref().module_kind();
-        if self.0.insert(kind.clone(), gen).is_some() {
-            panic!("Can't insert module of same kind twice: {kind}");
-        }
+        let r#gen: M = r#gen.into();
+        let kind = r#gen.as_ref().module_kind();
+        assert!(
+            self.0.insert(kind.clone(), r#gen).is_none(),
+            "Can't insert module of same kind twice: {kind}"
+        );
     }
 
     pub fn kinds(&self) -> BTreeSet<ModuleKind> {
@@ -414,49 +615,77 @@ impl<M> ModuleGenRegistry<M> {
 }
 
 impl ModuleRegistry<ConfigGenModuleParams> {
-    pub fn attach_config_gen_params<T: ModuleGenParams>(
+    pub fn attach_config_gen_params_by_id<T: ModuleInitParams>(
         &mut self,
         id: ModuleInstanceId,
         kind: ModuleKind,
-        gen: T,
+        r#gen: T,
     ) -> &mut Self {
-        self.register_module(
-            id,
-            kind,
-            ConfigGenModuleParams::from_typed(gen).expect("Invalid config gen params for {kind}"),
-        );
+        let params = ConfigGenModuleParams::from_typed(r#gen)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.register_module(id, kind, params);
+        self
+    }
+
+    pub fn attach_config_gen_params<T: ModuleInitParams>(
+        &mut self,
+        kind: ModuleKind,
+        r#gen: T,
+    ) -> &mut Self {
+        let params = ConfigGenModuleParams::from_typed(r#gen)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.append_module(kind, params);
         self
     }
 }
 
-impl ServerModuleGenRegistry {
-    pub fn to_common(&self) -> CommonModuleGenRegistry {
-        ModuleGenRegistry(
-            self.0
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_dyn_common()))
-                .collect(),
-        )
-    }
-}
-
-impl<M> ModuleGenRegistry<M>
+impl<M> ModuleInitRegistry<M>
 where
-    M: AsRef<dyn IDynCommonModuleGen + Send + Sync + 'static>,
+    M: AsRef<dyn IDynCommonModuleInit + Send + Sync + 'static>,
 {
+    #[deprecated(
+        note = "You probably want `available_decoders` to support missing module kinds. If you really want a strict behavior, use `decoders_strict`"
+    )]
     pub fn decoders<'a>(
         &self,
-        module_kinds: impl Iterator<Item = (ModuleInstanceId, &'a ModuleKind)>,
+        modules: impl Iterator<Item = (ModuleInstanceId, &'a ModuleKind)>,
     ) -> anyhow::Result<ModuleDecoderRegistry> {
-        let mut modules = BTreeMap::new();
-        for (id, kind) in module_kinds {
+        self.decoders_strict(modules)
+    }
+
+    /// Get decoders for `modules` and fail if any is unsupported
+    pub fn decoders_strict<'a>(
+        &self,
+        modules: impl Iterator<Item = (ModuleInstanceId, &'a ModuleKind)>,
+    ) -> anyhow::Result<ModuleDecoderRegistry> {
+        let mut decoders = BTreeMap::new();
+        for (id, kind) in modules {
             let Some(init) = self.0.get(kind) else {
-                anyhow::bail!("Detected configuration for unsupported module kind: {kind}")
+                anyhow::bail!(
+                    "Detected configuration for unsupported module id: {id}, kind: {kind}"
+                )
             };
 
-            modules.insert(id, (kind.clone(), init.as_ref().decoder()));
+            decoders.insert(id, (kind.clone(), init.as_ref().decoder()));
         }
-        Ok(ModuleDecoderRegistry::from(modules))
+        Ok(ModuleDecoderRegistry::from(decoders))
+    }
+
+    /// Get decoders for `modules` and skip unsupported ones
+    pub fn available_decoders<'a>(
+        &self,
+        modules: impl Iterator<Item = (ModuleInstanceId, &'a ModuleKind)>,
+    ) -> anyhow::Result<ModuleDecoderRegistry> {
+        let mut decoders = BTreeMap::new();
+        for (id, kind) in modules {
+            let Some(init) = self.0.get(kind) else {
+                warn!(target: LOG_CORE, "Unsupported module id: {id}, kind: {kind}");
+                continue;
+            };
+
+            decoders.insert(id, (kind.clone(), init.as_ref().decoder()));
+        }
+        Ok(ModuleDecoderRegistry::from(decoders))
     }
 }
 
@@ -464,7 +693,7 @@ where
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EmptyGenParams {}
 
-pub trait ModuleGenParams: serde::Serialize + serde::de::DeserializeOwned {
+pub trait ModuleInitParams: serde::Serialize + serde::de::DeserializeOwned {
     /// Locally configurable parameters for config generation
     type Local: DeserializeOwned + Serialize;
     /// Consensus parameters for config generation
@@ -494,20 +723,32 @@ pub struct ServerModuleConsensusConfig {
 pub struct ClientModuleConfig {
     pub kind: ModuleKind,
     pub version: ModuleConsensusVersion,
-    #[serde(with = "::hex::serde")]
-    pub config: Vec<u8>,
+    #[serde(with = "::fedimint_core::encoding::as_hex")]
+    pub config: DynRawFallback<DynClientConfig>,
 }
 
 impl ClientModuleConfig {
-    pub fn from_typed<T: Encodable + Serialize>(
+    pub fn from_typed<T: fedimint_core::core::ClientConfig>(
+        module_instance_id: ModuleInstanceId,
         kind: ModuleKind,
         version: ModuleConsensusVersion,
-        value: &T,
+        value: T,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             kind,
             version,
-            config: value.consensus_encode_to_vec()?,
+            config: fedimint_core::core::DynClientConfig::from_typed(module_instance_id, value)
+                .into(),
+        })
+    }
+
+    pub fn redecode_raw(
+        self,
+        modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, crate::encoding::DecodeError> {
+        Ok(Self {
+            config: self.config.redecode_raw(modules)?,
+            ..self
         })
     }
 
@@ -518,18 +759,18 @@ impl ClientModuleConfig {
     pub fn kind(&self) -> &ModuleKind {
         &self.kind
     }
-
-    pub fn value(&self) -> &[u8] {
-        &self.config
-    }
 }
 
 impl ClientModuleConfig {
-    pub fn cast<T: TypedClientModuleConfig>(&self) -> anyhow::Result<T> {
-        Ok(T::consensus_decode(
-            &mut &self.config[..],
-            &Default::default(),
-        )?)
+    pub fn cast<T>(&self) -> anyhow::Result<&T>
+    where
+        T: 'static,
+    {
+        self.config
+            .expect_decoded_ref()
+            .as_any()
+            .downcast_ref::<T>()
+            .context("can't convert client module config to desired type")
     }
 }
 
@@ -541,7 +782,6 @@ pub struct ServerModuleConfig {
     pub local: JsonWithKind,
     pub private: JsonWithKind,
     pub consensus: ServerModuleConsensusConfig,
-    pub consensus_json: JsonWithKind,
 }
 
 impl ServerModuleConfig {
@@ -549,21 +789,21 @@ impl ServerModuleConfig {
         local: JsonWithKind,
         private: JsonWithKind,
         consensus: ServerModuleConsensusConfig,
-        consensus_json: JsonWithKind,
     ) -> Self {
         Self {
             local,
             private,
             consensus,
-            consensus_json,
         }
     }
 
     pub fn to_typed<T: TypedServerModuleConfig>(&self) -> anyhow::Result<T> {
         let local = serde_json::from_value(self.local.value().clone())?;
         let private = serde_json::from_value(self.private.value().clone())?;
-        let consensus =
-            <T::Consensus>::consensus_decode(&mut &self.consensus.config[..], &Default::default())?;
+        let consensus = <T::Consensus>::consensus_decode_whole(
+            &self.consensus.config[..],
+            &ModuleRegistry::default(),
+        )?;
 
         Ok(TypedServerModuleConfig::from_parts(
             local, private, consensus,
@@ -580,9 +820,9 @@ pub trait TypedServerModuleConsensusConfig:
     fn version(&self) -> ModuleConsensusVersion;
 
     fn from_erased(erased: &ServerModuleConsensusConfig) -> anyhow::Result<Self> {
-        Ok(Self::consensus_decode(
-            &mut &erased.config[..],
-            &Default::default(),
+        Ok(Self::consensus_decode_whole(
+            &erased.config[..],
+            &ModuleRegistry::default(),
         )?)
     }
 }
@@ -613,64 +853,24 @@ pub trait TypedServerModuleConfig: DeserializeOwned + Serialize {
                 serde_json::to_value(local).expect("serialization can't fail"),
             ),
             private: JsonWithKind::new(
-                kind.clone(),
+                kind,
                 serde_json::to_value(private).expect("serialization can't fail"),
             ),
             consensus: ServerModuleConsensusConfig {
                 kind: consensus.kind(),
                 version: consensus.version(),
-                config: consensus
-                    .consensus_encode_to_vec()
-                    .expect("serialization can't fail"),
+                config: consensus.consensus_encode_to_vec(),
             },
-            consensus_json: JsonWithKind::new(
-                kind,
-                serde_json::to_value(consensus).expect("serialization can't fail"),
-            ),
         }
     }
 }
 
-/// Typed client side module config
-pub trait TypedClientModuleConfig:
-    DeserializeOwned + Serialize + Decodable + Encodable + MaybeSend + MaybeSync
-{
-    fn kind(&self) -> ModuleKind;
-
-    fn version(&self) -> ModuleConsensusVersion;
-
-    fn to_erased(&self) -> ClientModuleConfig {
-        ClientModuleConfig::from_typed(self.kind(), self.version(), self)
-            .expect("serialization can't fail")
-    }
-}
-
-/// Things that a `distributed_gen` config can send between peers
-// TODO: Needs to be modularized in case modules want to send new message types for DKG
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum DkgPeerMsg {
-    PublicKey(secp256k1::PublicKey),
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum P2PMessage {
+    Aleph(Vec<u8>),
+    Checksum(sha256::Hash),
     DistributedGen(SupportedDkgMessage),
-    // Dkg completed on our side
-    Done,
-}
-
-/// Result of running DKG
-pub type DkgResult<T> = Result<T, DkgError>;
-
-#[derive(Error, Debug)]
-/// Captures an error occurring in DKG
-pub enum DkgError {
-    /// User has cancelled the DKG task
-    #[error("Operation cancelled")]
-    Cancelled(#[from] Cancelled),
-    /// Error running DKG
-    #[error("Running DKG failed due to {0}")]
-    Failed(#[from] anyhow::Error),
-    #[error("The module was not found {0}")]
-    ModuleNotFound(ModuleKind),
-    #[error("Params for modules were not found {0:?}")]
-    ParamsNotFound(BTreeSet<ModuleKind>),
+    Encodable(Vec<u8>),
 }
 
 /// Supported (by Fedimint's code) `DkgMessage<T>` types
@@ -686,7 +886,7 @@ pub trait ISupportedDkgMessage: Sized + Serialize + DeserializeOwned {
 }
 
 /// `enum` version of [`SupportedDkgMessage`]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SupportedDkgMessage {
     G1(DkgMessage<G1Projective>),
     G2(DkgMessage<G2Projective>),
@@ -723,8 +923,8 @@ pub enum DkgMessage<G: DkgGroup> {
     HashedCommit(Sha256),
     Commit(#[serde(with = "serde_commit")] Vec<G>),
     Share(
-        #[serde(with = "serde_impl::scalar")] Scalar,
-        #[serde(with = "serde_impl::scalar")] Scalar,
+        #[serde(with = "bls12_381_serde::scalar")] Scalar,
+        #[serde(with = "bls12_381_serde::scalar")] Scalar,
     ),
     Extract(#[serde(with = "serde_commit")] Vec<G>),
 }
@@ -744,7 +944,7 @@ mod serde_commit {
     use crate::config::DkgGroup;
 
     pub fn serialize<S: Serializer, G: DkgGroup>(vec: &[G], s: S) -> Result<S::Ok, S::Error> {
-        let wrap_vec: Vec<Wrap<G>> = vec.iter().cloned().map(Wrap).collect();
+        let wrap_vec: Vec<Wrap<G>> = vec.iter().copied().map(Wrap).collect();
         wrap_vec.serialize(s)
     }
 
@@ -775,21 +975,21 @@ pub trait SGroup: Sized {
 
 impl SGroup for G2Projective {
     fn serialize2<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        serde_impl::g2::serialize(&self.to_affine(), s)
+        bls12_381_serde::g2::serialize(&self.to_affine(), s)
     }
 
     fn deserialize2<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-        serde_impl::g2::deserialize(d).map(G2Projective::from)
+        bls12_381_serde::g2::deserialize(d).map(Self::from)
     }
 }
 
 impl SGroup for G1Projective {
     fn serialize2<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        serde_impl::g1::serialize(&self.to_affine(), s)
+        bls12_381_serde::g1::serialize(&self.to_affine(), s)
     }
 
     fn deserialize2<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-        serde_impl::g1::deserialize(d).map(G1Projective::from)
+        bls12_381_serde::g1::deserialize(d).map(Self::from)
     }
 }
 
@@ -805,7 +1005,7 @@ pub fn load_from_file<T: DeserializeOwned>(path: &Path) -> Result<T, anyhow::Err
 pub mod serde_binary_human_readable {
     use std::borrow::Cow;
 
-    use bitcoin_hashes::hex::{FromHex, ToHex};
+    use hex::{FromHex, ToHex};
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -813,7 +1013,7 @@ pub mod serde_binary_human_readable {
         if s.is_human_readable() {
             let bytes =
                 bincode::serialize(x).map_err(|e| serde::ser::Error::custom(format!("{e:?}")))?;
-            s.serialize_str(&bytes.to_hex())
+            s.serialize_str(&bytes.encode_hex::<String>())
         } else {
             Serialize::serialize(x, s)
         }
@@ -822,10 +1022,64 @@ pub mod serde_binary_human_readable {
     pub fn deserialize<'d, T: DeserializeOwned, D: Deserializer<'d>>(d: D) -> Result<T, D::Error> {
         if d.is_human_readable() {
             let hex_str: Cow<str> = Deserialize::deserialize(d)?;
-            let bytes = Vec::from_hex(&hex_str).map_err(serde::de::Error::custom)?;
+            let bytes = Vec::from_hex(hex_str.as_ref()).map_err(serde::de::Error::custom)?;
             bincode::deserialize(&bytes).map_err(|e| serde::de::Error::custom(format!("{e:?}")))
         } else {
             Deserialize::deserialize(d)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use fedimint_core::config::{ClientConfig, GlobalClientConfig};
+
+    use crate::module::CoreConsensusVersion;
+
+    #[test]
+    fn test_dcode_meta() {
+        let config = ClientConfig {
+            global: GlobalClientConfig {
+                api_endpoints: BTreeMap::new(),
+                broadcast_public_keys: None,
+                consensus_version: CoreConsensusVersion { major: 0, minor: 0 },
+                meta: vec![
+                    ("foo".to_string(), "bar".to_string()),
+                    ("baz".to_string(), "\"bam\"".to_string()),
+                    ("arr".to_string(), "[\"1\", \"2\"]".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            modules: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            config
+                .meta::<String>("foo")
+                .expect("parsing legacy string failed"),
+            Some("bar".to_string())
+        );
+        assert_eq!(
+            config.meta::<String>("baz").expect("parsing string failed"),
+            Some("bam".to_string())
+        );
+        assert_eq!(
+            config
+                .meta::<Vec<String>>("arr")
+                .expect("parsing array failed"),
+            Some(vec!["1".to_string(), "2".to_string()])
+        );
+
+        assert!(config.meta::<Vec<String>>("foo").is_err());
+        assert!(config.meta::<Vec<String>>("baz").is_err());
+        assert_eq!(
+            config
+                .meta::<String>("arr")
+                .expect("parsing via legacy fallback failed"),
+            Some("[\"1\", \"2\"]".to_string())
+        );
     }
 }

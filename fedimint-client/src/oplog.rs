@@ -1,35 +1,63 @@
+use std::collections::HashSet;
 use std::fmt::Debug;
-use std::future;
-use std::io::{Read, Write};
+use std::ops::Range;
+use std::time::Duration;
 
-use async_stream::stream;
-use fedimint_core::db::{Database, DatabaseTransaction};
-use fedimint_core::encoding::{Decodable, DecodeError, Encodable};
-use fedimint_core::module::registry::ModuleDecoderRegistry;
+use fedimint_client_module::oplog::{
+    IOperationLog, JsonStringed, OperationLogEntry, OperationOutcome, UpdateStreamOrOutcome,
+};
+use fedimint_core::core::OperationId;
+use fedimint_core::db::{Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _};
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::time::now;
 use fedimint_core::util::BoxStream;
-use futures::{stream, Stream, StreamExt};
+use fedimint_core::{apply, async_trait_maybe_send};
+use fedimint_logging::LOG_CLIENT;
+use futures::StreamExt as _;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 use tracing::{error, instrument, warn};
 
-use crate::db::{
-    ChronologicalOperationLogKey, ChronologicalOperationLogKeyPrefix, OperationLogKey,
-};
-use crate::sm::OperationId;
+use crate::db::{ChronologicalOperationLogKey, OperationLogKey};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Clone)]
 pub struct OperationLog {
     db: Database,
+    oldest_entry: tokio::sync::OnceCell<ChronologicalOperationLogKey>,
 }
 
 impl OperationLog {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            oldest_entry: OnceCell::new(),
+        }
     }
 
-    pub async fn add_operation_log_entry(
+    /// Will return the oldest operation log key in the database and cache the
+    /// result. If no entry exists yet the DB will be queried on each call till
+    /// an entry is present.
+    async fn get_oldest_operation_log_key(&self) -> Option<ChronologicalOperationLogKey> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        self.oldest_entry
+            .get_or_try_init(move || async move {
+                dbtx.find_by_prefix(&crate::db::ChronologicalOperationLogKeyPrefix)
+                    .await
+                    .map(|(key, ())| key)
+                    .next()
+                    .await
+                    .ok_or(())
+            })
+            .await
+            .ok()
+            .copied()
+    }
+
+    pub async fn add_operation_log_entry_dbtx(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
         operation_id: OperationId,
@@ -38,12 +66,14 @@ impl OperationLog {
     ) {
         dbtx.insert_new_entry(
             &OperationLogKey { operation_id },
-            &OperationLogEntry {
-                operation_type: operation_type.to_string(),
-                meta: serde_json::to_value(operation_meta)
-                    .expect("Can only fail if meta is not serializable"),
-                outcome: None,
-            },
+            &OperationLogEntry::new(
+                operation_type.to_string(),
+                JsonStringed(
+                    serde_json::to_value(operation_meta)
+                        .expect("Can only fail if meta is not serializable"),
+                ),
+                None,
+            ),
         )
         .await;
         dbtx.insert_new_entry(
@@ -56,59 +86,89 @@ impl OperationLog {
         .await;
     }
 
-    /// Returns the last `limit` operations. To fetch the next page, pass the
-    /// last operation's [`ChronologicalOperationLogKey`] as `start_after`.
+    #[deprecated(since = "0.6.0", note = "Use `paginate_operations_rev` instead")]
     pub async fn list_operations(
         &self,
         limit: usize,
-        start_after: Option<ChronologicalOperationLogKey>,
+        last_seen: Option<ChronologicalOperationLogKey>,
     ) -> Vec<(ChronologicalOperationLogKey, OperationLogEntry)> {
-        let mut dbtx = self.db.begin_transaction().await;
-        let operations: Vec<ChronologicalOperationLogKey> = dbtx
-            .find_by_prefix_sorted_descending(&ChronologicalOperationLogKeyPrefix)
-            .await
-            .map(|(key, _)| key)
-            // FIXME: this is a schlemil-the-painter algorithm that will take longer the further
-            // back in history one goes. To avoid that I see two options:
-            //   1. Add a reference to the previous operation to each operation log entry,
-            //      essentially creating a linked list, which seem a little bit inelegant.
-            //   2. Add an option to prefix queries that allows to specify a start key
-            //
-            // The current implementation may also skip operations due to `SystemTime` not being
-            // guaranteed to be monotonous. The linked list approach would also fix that.
-            .skip_while(move |key| {
-                let skip = if let Some(start_after) = start_after {
-                    key.creation_time >= start_after.creation_time
-                } else {
-                    false
-                };
+        self.paginate_operations_rev(limit, last_seen).await
+    }
 
-                std::future::ready(skip)
-            })
-            .take(limit)
-            .collect::<Vec<_>>()
-            .await;
+    /// Returns the last `limit` operations. To fetch the next page, pass the
+    /// last operation's [`ChronologicalOperationLogKey`] as `start_after`.
+    pub async fn paginate_operations_rev(
+        &self,
+        limit: usize,
+        last_seen: Option<ChronologicalOperationLogKey>,
+    ) -> Vec<(ChronologicalOperationLogKey, OperationLogEntry)> {
+        const EPOCH_DURATION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
-        let mut operation_entries = Vec::with_capacity(operations.len());
+        let start_after_key = last_seen.unwrap_or_else(|| ChronologicalOperationLogKey {
+            // We don't expect any operations from the future to exist, since SystemTime isn't
+            // monotone and CI can be overloaded at times we add a small buffer to avoid flakiness
+            // in tests.
+            creation_time: now() + Duration::from_secs(30),
+            operation_id: OperationId([0; 32]),
+        });
 
-        for operation in operations {
-            let entry = dbtx
+        let Some(oldest_entry_key) = self.get_oldest_operation_log_key().await else {
+            return vec![];
+        };
+
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let mut operation_log_keys = Vec::with_capacity(limit);
+
+        // Find all the operation log keys in the requested window. Since we decided to
+        // not introduce a find_by_range_rev function we have to jump through some
+        // hoops, see also the comments in rev_epoch_ranges.
+        // TODO: Implement using find_by_range_rev if ever introduced
+        'outer: for key_range_rev in
+            rev_epoch_ranges(start_after_key, oldest_entry_key, EPOCH_DURATION)
+        {
+            let epoch_operation_log_keys_rev = dbtx
+                .find_by_range(key_range_rev)
+                .await
+                .map(|(key, ())| key)
+                .collect::<Vec<_>>()
+                .await;
+
+            for operation_log_key in epoch_operation_log_keys_rev.into_iter().rev() {
+                operation_log_keys.push(operation_log_key);
+                if operation_log_keys.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+
+        debug_assert!(
+            operation_log_keys.iter().collect::<HashSet<_>>().len() == operation_log_keys.len(),
+            "Operation log keys returned are not unique"
+        );
+
+        let mut operation_log_entries = Vec::with_capacity(operation_log_keys.len());
+        for operation_log_key in operation_log_keys {
+            let operation_log_entry = dbtx
                 .get_value(&OperationLogKey {
-                    operation_id: operation.operation_id,
+                    operation_id: operation_log_key.operation_id,
                 })
                 .await
                 .expect("Inconsistent DB");
-            operation_entries.push((operation, entry));
+            operation_log_entries.push((operation_log_key, operation_log_entry));
         }
 
-        operation_entries
+        operation_log_entries
     }
 
     pub async fn get_operation(&self, operation_id: OperationId) -> Option<OperationLogEntry> {
-        Self::get_operation_inner(&mut self.db.begin_transaction().await, operation_id).await
+        Self::get_operation_dbtx(
+            &mut self.db.begin_transaction_nc().await.into_nc(),
+            operation_id,
+        )
+        .await
     }
 
-    async fn get_operation_inner(
+    pub async fn get_operation_dbtx(
         dbtx: &mut DatabaseTransaction<'_>,
         operation_id: OperationId,
     ) -> Option<OperationLogEntry> {
@@ -116,24 +176,52 @@ impl OperationLog {
     }
 
     /// Sets the outcome of an operation
-    #[instrument(skip(db), level = "debug")]
+    #[instrument(target = LOG_CLIENT, skip(db), level = "debug")]
     pub async fn set_operation_outcome(
         db: &Database,
         operation_id: OperationId,
         outcome: &(impl Serialize + Debug),
     ) -> anyhow::Result<()> {
-        let outcome_json = serde_json::to_value(outcome).expect("Outcome is not serializable");
+        let outcome_json =
+            JsonStringed(serde_json::to_value(outcome).expect("Outcome is not serializable"));
 
         let mut dbtx = db.begin_transaction().await;
-        let mut operation = Self::get_operation_inner(&mut dbtx, operation_id)
+        let mut operation = Self::get_operation_dbtx(&mut dbtx.to_ref_nc(), operation_id)
             .await
             .expect("Operation exists");
-        operation.outcome = Some(outcome_json);
+        operation.set_outcome(OperationOutcome {
+            time: fedimint_core::time::now(),
+            outcome: outcome_json,
+        });
         dbtx.insert_entry(&OperationLogKey { operation_id }, &operation)
             .await;
         dbtx.commit_tx_result().await?;
 
         Ok(())
+    }
+
+    /// Returns an a [`UpdateStreamOrOutcome`] enum that can be converted into
+    /// an update stream for easier handling using
+    /// [`UpdateStreamOrOutcome::into_stream`] but can also be matched over to
+    /// shortcut the handling of final outcomes.
+    pub fn outcome_or_updates<U, S>(
+        db: &Database,
+        operation_id: OperationId,
+        operation_log_entry: OperationLogEntry,
+        stream_gen: impl FnOnce() -> S,
+    ) -> UpdateStreamOrOutcome<U>
+    where
+        U: Clone + Serialize + DeserializeOwned + Debug + MaybeSend + MaybeSync + 'static,
+        S: futures::Stream<Item = U> + MaybeSend + 'static,
+    {
+        match operation_log_entry.outcome::<U>() {
+            Some(outcome) => UpdateStreamOrOutcome::Outcome(outcome),
+            None => UpdateStreamOrOutcome::UpdateStream(caching_operation_update_stream(
+                db.clone(),
+                operation_id,
+                stream_gen(),
+            )),
+        }
     }
 
     /// Tries to set the outcome of an operation, but only logs an error if it
@@ -146,126 +234,116 @@ impl OperationLog {
         outcome: &(impl Serialize + Debug),
     ) {
         if let Err(e) = Self::set_operation_outcome(db, operation_id, outcome).await {
-            warn!("Error setting operation outcome: {e}");
+            warn!(
+                target: LOG_CLIENT,
+                "Error setting operation outcome: {e}"
+            );
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OperationLogEntry {
-    operation_type: String,
-    meta: serde_json::Value,
-    // TODO: probably change all that JSON to Dyn-types
-    pub(crate) outcome: Option<serde_json::Value>,
-}
-
-impl OperationLogEntry {
-    pub fn operation_type(&self) -> &str {
-        &self.operation_type
+#[apply(async_trait_maybe_send!)]
+impl IOperationLog for OperationLog {
+    async fn get_operation(&self, operation_id: OperationId) -> Option<OperationLogEntry> {
+        OperationLog::get_operation(self, operation_id).await
     }
 
-    pub fn meta<M: DeserializeOwned>(&self) -> M {
-        serde_json::from_value(self.meta.clone()).expect("JSON deserialization should not fail")
+    async fn get_operation_dbtx(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        operation_id: OperationId,
+    ) -> Option<OperationLogEntry> {
+        OperationLog::get_operation_dbtx(dbtx, operation_id).await
     }
 
-    /// Returns the last state update of the operation, if any was cached yet.
-    /// If this hasn't been the case yet and `None` is returned subscribe to the
-    /// appropriate update stream.
-    pub fn outcome<D: DeserializeOwned>(&self) -> Option<D> {
-        self.outcome.as_ref().map(|outcome| {
-            serde_json::from_value(outcome.clone()).expect("JSON deserialization should not fail")
-        })
+    async fn add_operation_log_entry_dbtx(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        operation_id: OperationId,
+        operation_type: &str,
+        operation_meta: serde_json::Value,
+    ) {
+        OperationLog::add_operation_log_entry_dbtx(
+            self,
+            dbtx,
+            operation_id,
+            operation_type,
+            operation_meta,
+        )
+        .await
     }
 
-    /// Returns an a [`UpdateStreamOrOutcome`] enum that can be converted into
-    /// an update stream for easier handling using
-    /// [`UpdateStreamOrOutcome::into_stream`] but can also be matched over to
-    /// shortcut the handling of final outcomes.
-    pub fn outcome_or_updates<'a, U, S>(
+    fn outcome_or_updates(
         &self,
         db: &Database,
         operation_id: OperationId,
-        stream_gen: impl FnOnce() -> S,
-    ) -> UpdateStreamOrOutcome<'a, U>
-    where
-        U: Clone + Serialize + DeserializeOwned + Debug + MaybeSend + MaybeSync + 'static,
-        S: Stream<Item = U> + MaybeSend + 'a,
-    {
-        match self.outcome::<U>() {
-            Some(outcome) => UpdateStreamOrOutcome::Outcome(outcome),
-            None => UpdateStreamOrOutcome::UpdateStream(caching_operation_update_stream(
-                db.clone(),
-                operation_id,
-                stream_gen(),
-            )),
-        }
-    }
-}
-
-impl Encodable for OperationLogEntry {
-    fn consensus_encode<W: Write>(&self, writer: &mut W) -> Result<usize, std::io::Error> {
-        let mut len = 0;
-        len += self.operation_type.consensus_encode(writer)?;
-        len += serde_json::to_string(&self.meta)
-            .expect("JSON serialization should not fail")
-            .consensus_encode(writer)?;
-        len += self
-            .outcome
-            .as_ref()
-            .map(|outcome| {
-                serde_json::to_string(outcome).expect("JSON serialization should not fail")
-            })
-            .consensus_encode(writer)?;
-
-        Ok(len)
-    }
-}
-
-impl Decodable for OperationLogEntry {
-    fn consensus_decode<R: Read>(
-        r: &mut R,
-        modules: &ModuleDecoderRegistry,
-    ) -> Result<Self, DecodeError> {
-        let operation_type = String::consensus_decode(r, modules)?;
-
-        let meta_str = String::consensus_decode(r, modules)?;
-        let meta = serde_json::from_str(&meta_str).map_err(DecodeError::from_err)?;
-
-        let outcome_str = Option::<String>::consensus_decode(r, modules)?;
-        let outcome = outcome_str
-            .map(|outcome_str| serde_json::from_str(&outcome_str).map_err(DecodeError::from_err))
-            .transpose()?;
-
-        Ok(OperationLogEntry {
-            operation_type,
-            meta,
-            outcome,
-        })
-    }
-}
-
-/// Either a stream of operation updates if the operation hasn't finished yet or
-/// its outcome otherwise.
-pub enum UpdateStreamOrOutcome<'a, U> {
-    UpdateStream(BoxStream<'a, U>),
-    Outcome(U),
-}
-
-impl<'a, U> UpdateStreamOrOutcome<'a, U>
-where
-    U: MaybeSend + MaybeSync + 'static,
-{
-    /// Returns a stream no matter if the operation is finished. If there
-    /// already is a cached outcome the stream will only return that, otherwise
-    /// all updates will be returned until the operation finishes.
-    pub fn into_stream(self) -> BoxStream<'a, U> {
-        match self {
-            UpdateStreamOrOutcome::UpdateStream(stream) => stream,
-            UpdateStreamOrOutcome::Outcome(outcome) => {
-                Box::pin(stream::once(future::ready(outcome)))
+        operation: OperationLogEntry,
+        stream_gen: Box<dyn FnOnce() -> BoxStream<'static, serde_json::Value>>,
+    ) -> UpdateStreamOrOutcome<serde_json::Value> {
+        match OperationLog::outcome_or_updates(db, operation_id, operation, stream_gen) {
+            UpdateStreamOrOutcome::UpdateStream(pin) => UpdateStreamOrOutcome::UpdateStream(pin),
+            UpdateStreamOrOutcome::Outcome(o) => {
+                UpdateStreamOrOutcome::Outcome(serde_json::from_value(o).expect("Can't fail"))
             }
         }
     }
+}
+/// Returns an iterator over the ranges of operation log keys, starting from the
+/// most recent range and going backwards in time till slightly later than
+/// `last_entry`.
+///
+/// Simplifying keys to integers and assuming a `start_after` of 100, a
+/// `last_entry` of 55 and an `epoch_duration` of 10 the ranges would be:
+/// ```text
+/// [90..100, 80..90, 70..80, 60..70, 50..60]
+/// ```
+fn rev_epoch_ranges(
+    start_after: ChronologicalOperationLogKey,
+    last_entry: ChronologicalOperationLogKey,
+    epoch_duration: Duration,
+) -> impl Iterator<Item = Range<ChronologicalOperationLogKey>> {
+    // We want to fetch all operations that were created before `start_after`, going
+    // backwards in time. This means "start" generally means a later time than
+    // "end". Only when creating a rust Range we have to swap the terminology (see
+    // comment there).
+    (0..)
+        .map(move |epoch| start_after.creation_time - epoch * epoch_duration)
+        // We want to get all operation log keys in the range [last_key, start_after). So as
+        // long as the start time is greater than the last key's creation time, we have to
+        // keep going.
+        .take_while(move |&start_time| start_time >= last_entry.creation_time)
+        .map(move |start_time| {
+            let end_time = start_time - epoch_duration;
+
+            // In the edge case that there were two events logged at exactly the same time
+            // we need to specify the correct operation_id for the first key. Otherwise, we
+            // could miss entries.
+            let start_key = if start_time == start_after.creation_time {
+                start_after
+            } else {
+                ChronologicalOperationLogKey {
+                    creation_time: start_time,
+                    operation_id: OperationId([0; 32]),
+                }
+            };
+
+            // We could also special-case the last key here, but it's not necessary, making
+            // it last_key if end_time < last_key.creation_time. We know there are no
+            // entries beyond last_key though, so the range query will be equivalent either
+            // way.
+            let end_key = ChronologicalOperationLogKey {
+                creation_time: end_time,
+                operation_id: OperationId([0; 32]),
+            };
+
+            // We want to go backwards using a forward range query. This means we have to
+            // swap the start and end keys and then reverse the vector returned by the
+            // query.
+            Range {
+                start: end_key,
+                end: start_key,
+            }
+        })
 }
 
 /// Wraps an operation update stream such that the last update before it closes
@@ -277,10 +355,10 @@ pub fn caching_operation_update_stream<'a, U, S>(
 ) -> BoxStream<'a, U>
 where
     U: Clone + Serialize + Debug + MaybeSend + MaybeSync + 'static,
-    S: Stream<Item = U> + MaybeSend + 'a,
+    S: futures::Stream<Item = U> + MaybeSend + 'a,
 {
     let mut stream = Box::pin(stream);
-    Box::pin(stream! {
+    Box::pin(async_stream::stream! {
         let mut last_update = None;
         while let Some(update) = stream.next().await {
             yield update.clone();
@@ -288,163 +366,13 @@ where
         }
 
         let Some(last_update) = last_update else {
-            error!("Stream ended without any updates, this should not happen!");
+            error!(
+                target: LOG_CLIENT,
+                "Stream ended without any updates, this should not happen!"
+            );
             return;
         };
 
         OperationLog::optimistically_set_operation_outcome(&db, operation_id, &last_update).await;
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use fedimint_core::db::mem_impl::MemDatabase;
-    use fedimint_core::db::Database;
-    use futures::stream::StreamExt;
-    use serde::{Deserialize, Serialize};
-
-    use super::UpdateStreamOrOutcome;
-    use crate::db::ChronologicalOperationLogKey;
-    use crate::oplog::{OperationLog, OperationLogEntry};
-    use crate::sm::OperationId;
-
-    #[test]
-    fn test_operation_log_entry_serde() {
-        let op_log = OperationLogEntry {
-            operation_type: "test".to_string(),
-            meta: serde_json::to_value(()).unwrap(),
-            outcome: None,
-        };
-
-        op_log.meta::<()>();
-    }
-
-    #[test]
-    fn test_operation_log_entry_serde_extra_meta() {
-        #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-        struct Meta {
-            foo: String,
-            extra_meta: serde_json::Value,
-        }
-
-        let meta = Meta {
-            foo: "bar".to_string(),
-            extra_meta: serde_json::to_value(()).unwrap(),
-        };
-
-        let op_log = OperationLogEntry {
-            operation_type: "test".to_string(),
-            meta: serde_json::to_value(meta.clone()).unwrap(),
-            outcome: None,
-        };
-
-        assert_eq!(op_log.meta::<Meta>(), meta);
-    }
-
-    #[tokio::test]
-    async fn test_operation_log_update() {
-        let op_id = OperationId([0x32; 32]);
-
-        let db = Database::new(MemDatabase::new(), Default::default());
-        let op_log = OperationLog::new(db.clone());
-
-        let mut dbtx = db.begin_transaction().await;
-        op_log
-            .add_operation_log_entry(&mut dbtx, op_id, "foo", "bar")
-            .await;
-        dbtx.commit_tx().await;
-
-        let op = op_log.get_operation(op_id).await.expect("op exists");
-        assert_eq!(op.outcome, None);
-
-        OperationLog::set_operation_outcome(&db, op_id, &"baz")
-            .await
-            .unwrap();
-
-        let op = op_log.get_operation(op_id).await.expect("op exists");
-        assert_eq!(op.outcome::<String>(), Some("baz".to_string()));
-
-        let update_stream_or_outcome =
-            op.outcome_or_updates::<String, _>(&db, op_id, futures::stream::empty);
-
-        assert!(matches!(
-            &update_stream_or_outcome,
-            UpdateStreamOrOutcome::Outcome(s) if s == "baz"
-        ));
-
-        let updates = update_stream_or_outcome
-            .into_stream()
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(updates, vec!["baz"]);
-    }
-
-    #[tokio::test]
-    async fn test_operation_log_update_from_stream() {
-        let op_id = OperationId([0x32; 32]);
-
-        let db = Database::new(MemDatabase::new(), Default::default());
-        let op_log = OperationLog::new(db.clone());
-
-        let mut dbtx = db.begin_transaction().await;
-        op_log
-            .add_operation_log_entry(&mut dbtx, op_id, "foo", "bar")
-            .await;
-        dbtx.commit_tx().await;
-
-        let op = op_log.get_operation(op_id).await.expect("op exists");
-
-        let updates = vec!["bar".to_owned(), "bob".to_owned(), "baz".to_owned()];
-        let update_stream = op
-            .outcome_or_updates::<String, _>(&db, op_id, || futures::stream::iter(updates.clone()));
-
-        let received_updates = update_stream.into_stream().collect::<Vec<_>>().await;
-        assert_eq!(received_updates, updates);
-
-        let op_updated = op_log.get_operation(op_id).await.expect("op exists");
-        assert_eq!(op_updated.outcome::<String>(), Some("baz".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_pagination() {
-        let db = Database::new(MemDatabase::new(), Default::default());
-        let op_log = OperationLog::new(db.clone());
-
-        for operation_idx in 0u8..98 {
-            let mut dbtx = db.begin_transaction().await;
-            op_log
-                .add_operation_log_entry(
-                    &mut dbtx,
-                    OperationId([operation_idx; 32]),
-                    "foo",
-                    operation_idx,
-                )
-                .await;
-            dbtx.commit_tx().await;
-        }
-
-        fn assert_page_entries(
-            page: Vec<(ChronologicalOperationLogKey, OperationLogEntry)>,
-            page_idx: u8,
-        ) {
-            for (entry_idx, (_key, entry)) in page.into_iter().enumerate() {
-                let actual_meta = entry.meta::<u8>();
-                let expected_meta = 97 - (page_idx * 10 + entry_idx as u8);
-
-                assert_eq!(actual_meta, expected_meta);
-            }
-        }
-
-        let mut previous_last_element = None;
-        for page_idx in 0u8..9 {
-            let page = op_log.list_operations(10, previous_last_element).await;
-            assert_eq!(page.len(), 10);
-            previous_last_element = Some(page[9].0);
-            assert_page_entries(page, page_idx);
-        }
-
-        let page = op_log.list_operations(10, previous_last_element).await;
-        assert_eq!(page.len(), 8);
-        assert_page_entries(page, 9);
-    }
 }

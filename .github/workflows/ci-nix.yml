@@ -2,29 +2,51 @@
 
 name: "CI (nix)"
 
+env:
+  PERFIT_SERVER: https://perfit.dev.fedimint.org
+
 # Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
+  # Triggers the workflow on push or pull request events but only for the "main" branch and release tags
   push:
-    branches: [ "main", "master", "devel" ]
+    branches: [ "main", "master", "devel", "releases/v*" ]
+    tags:
+      - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
   pull_request:
-    branches: [ "main", "master", "devel" ]
+    branches: [ "main", "master", "devel", "releases/v*" ]
+  merge_group:
+    branches: [ "main", "master", "devel", "releases/v*" ]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+# https://stackoverflow.com/questions/66335225/how-to-cancel-previous-runs-in-the-pr-when-you-push-new-commitsupdate-the-curre
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
+  self-care:
+    name: Flake self-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Nix flake inputs
+        if: github.event_name == 'pull_request' && github.base_ref == 'master'
+        uses: DeterminateSystems/flake-checker-action@v9
+        with:
+          fail-mode: true
+          nixpkgs-keys: nixpkgs
+
   lint:
     name: "Lint"
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
-      - uses: cachix/install-nix-action@v22
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
-      - uses: cachix/cachix-action@v12
+      - uses: actions/checkout@v4
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+      - uses: cachix/cachix-action@v15
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
@@ -35,25 +57,73 @@ jobs:
         run: nix develop --ignore-environment .#lint --command ./misc/git-hooks/pre-commit
 
       - name: Check udeps
-        run: nix build -L .#ci.workspaceCargoUdeps
+        run: nix build -L .#nightly.test.workspaceCargoUdeps || echo "Disabled until Nix's version can handle 2024 edition"
 
-  build:
+      - name: Check `nix flake show`
+        run: nix flake show .#
+
+      # Since we don't have capacity to build Darwin in PRs, at least make sure it evaluates
+      - name: Evaluate MacOS shell
+        run: nix eval --system aarch64-darwin .#devShells.aarch64-darwin.default
+
+      - name: Evaluate MacOS build
+        run: nix eval --system aarch64-darwin .#workspaceBuild
+
+  shell:
+    if: github.repository == 'fedimint/fedimint'
     strategy:
       matrix:
         host:
           - linux
           - macos
         include:
-          - on: linux
-            runs-on: buildjet-8vcpu-ubuntu-2004
+          - host: linux
+            runs-on: [self-hosted, linux]
+            build-in-pr: false
+            timeout: 30
+          - host: macos
+            runs-on: macos-14
+            build-in-pr: false
+            timeout: 60
+
+    name: "Dev Shell on ${{ matrix.host }}"
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ matrix.timeout }}
+
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+      - uses: cachix/cachix-action@v15
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        with:
+          name: fedimint
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        continue-on-error: true
+
+      - name: Build dev shell
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        run: nix develop -L -c true
+
+  build:
+    if: github.repository == 'fedimint/fedimint'
+    strategy:
+      matrix:
+        host:
+          - linux
+          - macos
+        include:
+          - host: linux
+            runs-on: [self-hosted, linux]
             build-in-pr: true
-            timeout: 20
+            timeout: 90
             run-tests: true
           - host: macos
-            runs-on: macos-12
+            runs-on: macos-14
             build-in-pr: false
             # TODO: Too slow; see https://github.com/actions/runner-images/issues/1336
-            timeout: 60
+            timeout: 75
             run-tests: false
 
     name: "Build on ${{ matrix.host }}"
@@ -61,173 +131,183 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
-      - uses: actions/checkout@v3
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+      - uses: actions/checkout@v4
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
 
-      - uses: cachix/install-nix-action@v22
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
-      - uses: cachix/cachix-action@v12
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+      - name: Prepare
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        uses: ./.github/actions/prepare
+
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+      - uses: cachix/cachix-action@v15
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
 
       - name: Build workspace
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
-        run: nix build -L .#ci.workspaceBuild
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        run: |
+          env \
+            PERFIT_ACCESS_TOKEN="${{ secrets.PERFIT_ACCESS_TOKEN }}" \
+            nix run 'github:rustshop/perfit?rev=a2ea3bae86b0e70d2ebdbca1fd16a843b7f0a3bd#perfit' -- \
+              run \
+                --metric Ym4MS7aDRj6b64woEHq4bw \
+                --metadata "commit=${LAST_COMMIT_SHA}" \
+                -- \
+              nix build -L .#ci.workspaceBuild
 
       - name: Clippy workspace
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
         run: nix build -L .#ci.workspaceClippy
 
       - name: Run cargo doc
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+        if: (github.event_name != 'pull_request' || matrix.build-in-pr) && (matrix.host != 'macos')
         run: nix build -L .#ci.workspaceDoc
 
       - name: Test docs
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+        if: (github.event_name != 'pull_request' || matrix.build-in-pr) && (matrix.host != 'macos')
         run: nix build -L .#ci.workspaceTestDoc
 
       - name: Tests
-        if: (github.ref == 'refs/heads/master' || matrix.build-in-pr) && matrix.run-tests
-        run: nix build -L .#ci.cli-test.all
+        if: (github.event_name != 'pull_request' || matrix.build-in-pr) && matrix.run-tests
+        run: |
+          env \
+            PERFIT_ACCESS_TOKEN="${{ secrets.PERFIT_ACCESS_TOKEN }}" \
+            nix run 'github:rustshop/perfit?rev=a2ea3bae86b0e70d2ebdbca1fd16a843b7f0a3bd#perfit' -- \
+              run \
+                --metric HEnBvtqET8iKgJOMMkFoXw \
+                --metadata "commit=${LAST_COMMIT_SHA}" \
+                -- \
+              nix build -L .#wasm32-unknown.ci.ciTestAll
+
+      - name: Tests (5 times more)
+        if: github.event_name == 'merge_group' && matrix.run-tests
+        run: |
+          env \
+            PERFIT_ACCESS_TOKEN="${{ secrets.PERFIT_ACCESS_TOKEN }}" \
+            nix run 'github:rustshop/perfit?rev=a2ea3bae86b0e70d2ebdbca1fd16a843b7f0a3bd#perfit' -- \
+              run \
+                --metric _fJdigFYTj6zSGjwx3-WUg \
+                --metadata "commit=${LAST_COMMIT_SHA}" \
+                -- \
+            nix build -L .#wasm32-unknown.ci.ciTestAll5Times
 
       - name: Wasm Tests
-        if: (github.ref == 'refs/heads/master' || matrix.build-in-pr) && matrix.run-tests
-        run: nix build -L .#ci.wasm-tests
+        if: (github.event_name != 'pull_request' || matrix.build-in-pr) && matrix.run-tests && (matrix.host != 'macos')
+        run: |
+          env \
+            PERFIT_ACCESS_TOKEN="${{ secrets.PERFIT_ACCESS_TOKEN }}" \
+            nix run 'github:rustshop/perfit?rev=a2ea3bae86b0e70d2ebdbca1fd16a843b7f0a3bd#perfit' -- \
+              run \
+                --metric 4DtvtPWIQWe--cY6K-wSCg \
+                --metadata "commit=${LAST_COMMIT_SHA}" \
+                -- \
+          nix build -L .#wasm32-unknown.ci.wasmTest
 
   audit:
+    if: github.repository == 'fedimint/fedimint'
     name: "Audit"
-    runs-on: buildjet-2vcpu-ubuntu-2004
+    runs-on: [self-hosted, linux]
     timeout-minutes: 10
     # sometimes we can't fix these immediately, yet
     # we don't want to stop the world because of it
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v3
-      - uses: cachix/install-nix-action@v22
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
-      - uses: cachix/cachix-action@v12
-        with:
-          name: fedimint
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-
-      - name: Run cargo audit
-        run: |
-          nix flake lock --update-input advisory-db
-          nix build -L .#ci.workspaceAudit
-
-  # Code Coverage will build using a completely different profile (neither debug/release)
-  # Which means we can not reuse much from `build` job. Might as well run it as another
-  # build in parallel
-  ccov:
-    name: "Code coverage"
-    runs-on: buildjet-8vcpu-ubuntu-2004
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v3
-      - uses: cachix/install-nix-action@v22
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
-      - uses: cachix/cachix-action@v12
+      - uses: actions/checkout@v4
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+      - uses: cachix/cachix-action@v15
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
 
-      - name: Validate codecov.yaml configuration
-        run: nix run nixpkgs#curl -- --fail-with-body -X POST --data-binary @.codecov.yml https://codecov.io/validate
+      - name: Run cargo audit
+        run: |
+          nix flake update advisory-db || nix flake lock --update-input advisory-db
+          nix build -L .#ci.cargoAudit
 
-      - name: Build and run tests with Code Coverage
-        run: nix build -L .#ci.workspaceCov
-
-      - name: Ensure lcov.info exists
-        run: test -f result/lcov.info
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: result/lcov.info
+      - name: Run cargo deny
+        run: |
+          nix build -L .#ci.cargoDeny
 
   cross:
-    name: "Cross-compile on ${{ matrix.host }} to ${{ matrix.target}}"
+    name: "Cross-compile on ${{ matrix.host }} to ${{ matrix.toolchain }}"
+    needs: [lint, shell]
 
     strategy:
       matrix:
         host:
           - linux
           - macos
-        target:
-          - aarch64-linux-android
-          - armv7-linux-androideabi
-          - x86_64-linux-android
-          - i686-linux-android
-          - wasm32-unknown-unknown
+        toolchain:
+          - aarch64-android
+          - armv7-android
+          - x86_64-android
+          - wasm32-unknown
         include:
           - host: linux
-            runs-on: ubuntu-22.04
+            runs-on: [self-hosted, linux]
             build-in-pr: true
-            timeout: 20
+            # TODO: debugging network issues, should reduce to 20 minutes
+            # https://github.com/fedimint/fedimint/issues/4488
+            timeout: 60
           - host: macos
-            runs-on: macos-12
+            runs-on: macos-14
             build-in-pr: false
             # TODO: Too slow; see https://github.com/actions/runner-images/issues/1336
-            timeout: 60
+            timeout: 120
         exclude:
-            # there's not enough macos runners available for our CI, so test only the more important cross-compilation targets
+            # there's not enough macos runners available for our CI, so test only the more important cross-compilation toolchains
             # if they work, rest probably works as well
           - host: macos
-            target: armv7-linux-androideabi
+            toolchain: armv7-android
           - host: macos
-            target: i686-linux-android
-          - host: macos
-            target: x86_64-linux-android
-
+            toolchain: x86_64-android
 
 
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
-      - uses: actions/checkout@v3
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+      - uses: actions/checkout@v4
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
 
-      - uses: cachix/install-nix-action@v22
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
 
-      - uses: cachix/cachix-action@v12
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
+      - uses: cachix/cachix-action@v15
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
 
-      - name: Build client packages for ${{ matrix.target }}
-        if: github.ref == 'refs/heads/master' || matrix.build-in-pr
-        run: nix build -L .#cross.${{ matrix.target }}.client-pkgs
+      - name: Build client packages for ${{ matrix.toolchain }}
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        run: |
+          nix build -L .#${{ matrix.toolchain }}.ci.client-pkgs
 
+      - name: Build fedimint-client-wasm package for ${{ matrix.toolchain }}
+        if: (github.event_name != 'pull_request' || matrix.build-in-pr) && (matrix.toolchain == 'wasm32-unknown')
+        run: |
+          nix build -L .#${{ matrix.toolchain }}.ci.fedimint-client-wasm
 
   containers:
+    if: github.repository == 'fedimint/fedimint'
     name: "Containers"
-    runs-on: buildjet-8vcpu-ubuntu-2004
-    timeout-minutes: 30
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 60
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Prepare
         uses: ./.github/actions/prepare
-      - uses: actions/checkout@v3
-      - uses: cachix/install-nix-action@v22
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
-      - uses: cachix/cachix-action@v12
+      - uses: actions/checkout@v4
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+      - uses: cachix/cachix-action@v15
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
@@ -235,38 +315,64 @@ jobs:
 
       - name: Build fedimintd container
         run: |
-          nix build -L .#container.fedimintd
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.fedimintd
+          else
+            nix build -L .#container.fedimintd
+          fi
           echo "fedimintd_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build fedimint-cli container
         run: |
-          nix build -L .#container.fedimint-cli
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.fedimint-cli
+          else
+            nix build -L .#container.fedimint-cli
+          fi
           echo "fedimint_cli_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build gatewayd container
         run: |
-          nix build -L .#container.gatewayd
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.gatewayd
+          else
+            nix build -L .#container.gatewayd
+          fi
           echo "gatewayd_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build gateway-cli container
         run: |
-          nix build -L .#container.gateway-cli
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.gateway-cli
+          else
+            nix build -L .#container.gateway-cli
+          fi
           echo "gateway-cli_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
+      - name: Build devtools container
+        run: |
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.devtools
+          else
+            nix build -L .#container.devtools
+          fi
+          echo "devtools_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
+
       - name: Login to Docker Hub
-        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/kody-setup-rebase'
-        uses: docker/login-action@v2
+        if: github.ref == 'refs/heads/master' || github.ref_type == 'tag'
+        uses: docker/login-action@v3
         with:
           username: fedimint
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Publish
-        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/kody-setup-rebase'
+        if: github.ref == 'refs/heads/master'
         run: |
           nix_tag=${{ env.fedimintd_container_tag }} && hub_tag="fedimint/fedimintd:${LAST_COMMIT_SHA}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
           nix_tag=${{ env.fedimint_cli_container_tag }} && hub_tag="fedimint/fedimint-cli:${LAST_COMMIT_SHA}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
           nix_tag=${{ env.gatewayd_container_tag }} && hub_tag="fedimint/gatewayd:${LAST_COMMIT_SHA}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
           nix_tag=${{ env.gateway-cli_container_tag }} && hub_tag="fedimint/gateway-cli:${LAST_COMMIT_SHA}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+          nix_tag=${{ env.devtools_container_tag }} && hub_tag="fedimint/devtools:${LAST_COMMIT_SHA}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
 
       - name: Publish master tag
         if: github.ref == 'refs/heads/master'
@@ -275,52 +381,201 @@ jobs:
           nix_tag=${{ env.fedimint_cli_container_tag }} && hub_tag="fedimint/fedimint-cli:master" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
           nix_tag=${{ env.gatewayd_container_tag }} && hub_tag="fedimint/gatewayd:master" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
           nix_tag=${{ env.gateway-cli_container_tag }} && hub_tag="fedimint/gateway-cli:master" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+          nix_tag=${{ env.devtools_container_tag }} && hub_tag="fedimint/devtools:master" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        run: |
+          nix_tag=${{ env.fedimintd_container_tag }} && hub_tag="fedimint/fedimintd:${GITHUB_REF_NAME}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+          nix_tag=${{ env.fedimint_cli_container_tag }} && hub_tag="fedimint/fedimint-cli:${GITHUB_REF_NAME}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+          nix_tag=${{ env.gatewayd_container_tag }} && hub_tag="fedimint/gatewayd:${GITHUB_REF_NAME}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+          nix_tag=${{ env.gateway-cli_container_tag }} && hub_tag="fedimint/gateway-cli:${GITHUB_REF_NAME}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
+          nix_tag=${{ env.devtools_container_tag }} && hub_tag="fedimint/devtools:${GITHUB_REF_NAME}" && docker tag "$nix_tag" "$hub_tag" && docker push "$hub_tag"
 
   pkgs:
-    if: github.ref == 'refs/heads/master'
-    name: "Release packages: ${{ matrix.build.pkg }}"
+    if: github.repository == 'fedimint/fedimint' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/releases') || github.ref_type == 'tag')
+    name: "Release packages: ${{ matrix.build.flake-output }}"
 
     strategy:
       matrix:
         build:
-          - pkg: client-pkgs
-            bin: fedimint-cli
-          - pkg: fedimint-pkgs
-            bin: fedimintd
-          - pkg: gateway-pkgs
-            bin: gateway-cli
+          - flake-output: fedimint-pkgs
+            bins: fedimintd,fedimint-cli,fedimint-dbtool,fedimint-recoverytool
+            deb: fedimint
+          - flake-output: gateway-pkgs
+            bins: gateway-cli,gatewayd
+            deb: fedimint-gateway
+          - flake-output: devimint
+            bins: devimint,devimint-faucet
+            deb: devimint
 
-    runs-on: buildjet-4vcpu-ubuntu-2004
-    timeout-minutes: 30
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 60
+
+    env:
+      PRERELEASE_MESSAGE: |
+        ⚠️ **Pre-release Notice**
+
+        - This is a release candidate version
+        - Features may be unstable
+        - You may not be able to upgrade to the final release
+        - Not recommended for mainnet use
+
+        Please report any issues you encounter.
+
     steps:
-      - uses: actions/checkout@v3
-      - uses: cachix/install-nix-action@v22
-        with:
-          nix_path: nixpkgs=channel:nixos-22.05
-      - uses: cachix/cachix-action@v12
+      - uses: actions/checkout@v4
+      - uses: dpc/nix-installer-action@dpc/jj-vqymqvyntouw
+      - uses: cachix/cachix-action@v15
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
 
-      - name: Build ${{ matrix.build.pkg }}
-        run: nix build -L .#${{ matrix.build.pkg }}
+      - name: Set BUILD_ID to tag or commit hash
+        run: |
+          if [[ $GITHUB_REF_TYPE == "tag" ]]; then
+            echo "BUILD_ID=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          else
+            echo "BUILD_ID=${GITHUB_SHA}" >> $GITHUB_ENV
+          fi
 
-      - name: Check version ${{ matrix.build.bin }}
-        run: nix run .#${{ matrix.build.bin }} version-hash && echo "$GITHUB_SHA" && test "$(nix run .#${{ matrix.build.bin }} version-hash)" = "${GITHUB_SHA}"
+      - name: Build ${{ matrix.build.flake-output }}
+        env:
+          # seems like cachix needs this explicitly set in the env
+          CACHIX_AUTH_TOKEN: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        run: |
+          >&2 echo "Building: ${{ matrix.build.flake-output }}"
+          nix build -L .#${{ matrix.build.flake-output }}
+          mkdir -p bins
+          bins="${{ matrix.build.bins }}"
+          for bin in ${bins//,/ } ; do
+            if [[ $GITHUB_REF_TYPE == "tag" ]]; then
+              >&2 echo "Building: $bin"
+              nix build -L .#$bin
 
-      - name: Check sha256sum ${{ matrix.build.bin }}
-        run: nix build .#${{ matrix.build.bin }} && sha256sum "./result/bin/${{ matrix.build.bin }}"
+              closure_size=$(nix path-info -rS --json .#bin| jq '. | to_entries[] | select(.value.ultimate == true) | .value.narSize')
+              >&2 echo "$bin's Nix closure size: $closure_size"
+
+              if [ 150000000 -lt $closure_size ]; then
+                >&2 echo "$bin's Nix closure size seems too big: $closure_size"
+                exit 1
+              fi
+
+              >&2 echo "Pushing to cachix: $bin"
+              cachix push fedimint -c 8 -j 8 $(nix-store --query --references $(readlink -f result)) $(readlink -f result)
+              >&2 echo "Pining in cachix: fedimint-release-$bin:$BUILD_ID"
+              if [[ $var == *"-rc."* ]] || [[ $var == *"-alpha."* ]] || [[ $var == *"-testing."* ]] ; then
+                >&2 echo "Will not pin in cachix, as looks like a pre-release"
+              else
+                cachix pin fedimint "fedimint-release-$bin:$BUILD_ID" $(readlink -f result)
+              fi
+            fi
+            # Note: keep in sync with sign.sh
+            >&2 echo "Building bundled: $bin"
+            nix bundle --bundler .# ".#$bin" -o "bins/$bin-$BUILD_ID" && sha256sum "bins/$bin-$BUILD_ID"
+          done
+
+      - name: Check version ${{ matrix.build.bins }}
+        run: |
+          bins="${{ matrix.build.bins }}"
+          for bin in ${bins//,/ } ; do
+            >&2 echo "Checking version: $bin"
+            nix run .#$bin version-hash && echo "$GITHUB_SHA" && test "$(nix run .#$bin version-hash)" = "${GITHUB_SHA}"
+          done
+
+      - name: Check sha256sum ${{ matrix.build.bins }}
+        run: |
+          bins="${{ matrix.build.bins }}"
+          for bin in ${bins//,/ } ; do
+            >&2 echo "Checking sha256sum: $bin"
+            nix build -L .#$bin && sha256sum "./result/bin/$bin"
+          done
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.build.flake-output}}-linux-x86_64"
+          path: "bins/**"
+
+      - name: Release Binaries
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: "bins/**"
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          body: ${{ contains(github.ref, 'rc') && env.PRERELEASE_MESSAGE || '' }}
+
+      - name: Build DEB package
+        run: |
+          bins="${{ matrix.build.bins }}"
+          for bin in ${bins//,/ } ; do
+            >&2 echo "Bundling DEB: $bin"
+            nix bundle -L --bundler .#toDEB --accept-flake-config -o debs/$bin .#$bin
+            # workaround: https://github.com/actions/upload-artifact/issues/92
+            cp -a debs/$bin/*.deb debs/
+          done
+
+      - name: Build RPM package
+        run: |
+          bins="${{ matrix.build.bins }}"
+          for bin in ${bins//,/ } ; do
+            >&2 echo "Bundling RPM: $bin"
+            nix bundle -L --bundler .#toRPM --accept-flake-config -o rpms/$bin .#$bin
+            # workaround: https://github.com/actions/upload-artifact/issues/92
+            cp -a rpms/$bin/*.rpm rpms/
+          done
+
+      - name: Upload DEB packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.build.flake-output }}-deb-bundle"
+          path: "debs/**.deb"
+
+      - name: Release DEB packages
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: "debs/**.deb"
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          body: ${{ contains(github.ref, 'rc') && env.PRERELEASE_MESSAGE || '' }}
+
+      - name: Upload RPM packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.build.flake-output }}-rpm-bundle"
+          path: "rpms/**.rpm"
+
+      - name: Release RPM packages
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: "rpms/**.rpm"
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          body: ${{ contains(github.ref, 'rc') && env.PRERELEASE_MESSAGE || '' }}
+
+  status:
+    name: Status
+    needs: [lint, shell, build, cross, containers, pkgs]
+    if: ${{ always() }}
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Check status of all jobs
+        if: >-
+          ${{
+            contains(needs.*.result, 'failure') ||
+            contains(needs.*.result, 'cancelled')
+          }}
+        run: exit 1
 
   notifications:
-    # if: github.ref == 'refs/heads/master'
-    if: always()
+    if: always() && github.repository == 'fedimint/fedimint' && github.event_name != 'merge_group'
     name: "Notifications"
     timeout-minutes: 1
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux]
     # note: we don't depend on `audit` because it will
     # be often broken, and we can't fix it immediately
-    needs: [ build, cross, ccov, containers, pkgs ]
+    needs: [ lint, build, shell, cross, containers, pkgs ]
 
     steps:
     - name: Discord notifications on failure

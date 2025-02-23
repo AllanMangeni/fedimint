@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
-use std::iter::FromIterator;
 
 use fedimint_core::Amount;
 use serde::{Deserialize, Serialize};
-use tbs::{PublicKeyShare, SecretKeyShare};
 
 use crate::encoding::{Decodable, DecodeError, Encodable};
 use crate::module::registry::ModuleDecoderRegistry;
@@ -23,7 +21,7 @@ pub struct Tiered<T>(BTreeMap<Amount, T>);
 
 impl<T> Default for Tiered<T> {
     fn default() -> Self {
-        Self(Default::default())
+        Self(BTreeMap::default())
     }
 }
 
@@ -50,7 +48,11 @@ impl<T> Tiered<T> {
         self.0.keys()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Amount, &T)> {
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &T> {
+        self.0.values()
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Amount, &T)> {
         self.0.iter().map(|(amt, key)| (*amt, key))
     }
 
@@ -85,25 +87,15 @@ impl<T> Tiered<T> {
     }
 }
 
-impl Tiered<SecretKeyShare> {
-    pub fn to_public(&self) -> Tiered<PublicKeyShare> {
-        Tiered(
-            self.iter()
-                .map(|(amt, key)| (amt, key.to_pub_key_share()))
-                .collect(),
-        )
-    }
-}
-
 impl Tiered<()> {
-    /// Generates denominations as powers of 2 up to and including `max`
-    pub fn gen_denominations(max: Amount) -> Tiered<()> {
+    /// Generates denominations of a given base up to and including `max`
+    pub fn gen_denominations(denomination_base: u16, max: Amount) -> Self {
         let mut amounts = vec![];
 
         let mut denomination = Amount::from_msats(1);
         while denomination <= max {
             amounts.push((denomination, ()));
-            denomination = denomination * 2;
+            denomination = denomination * denomination_base.into();
         }
 
         amounts.into_iter().collect()
@@ -112,7 +104,16 @@ impl Tiered<()> {
 
 impl<T> FromIterator<(Amount, T)> for Tiered<T> {
     fn from_iter<I: IntoIterator<Item = (Amount, T)>>(iter: I) -> Self {
-        Tiered(iter.into_iter().collect())
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl<T> IntoIterator for Tiered<T> {
+    type Item = (Amount, T);
+    type IntoIter = std::collections::btree_map::IntoIter<Amount, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 
@@ -120,8 +121,9 @@ impl<C> Encodable for Tiered<C>
 where
     C: Encodable,
 {
-    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, std::io::Error> {
-        self.0.consensus_encode(writer)
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+        self.0.consensus_encode(writer)?;
+        Ok(())
     }
 }
 
@@ -129,11 +131,11 @@ impl<C> Decodable for Tiered<C>
 where
     C: Decodable,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_partial<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        Ok(Tiered(BTreeMap::consensus_decode(d, modules)?))
+        Ok(Self(BTreeMap::consensus_decode_partial(d, modules)?))
     }
 }
 
@@ -146,9 +148,18 @@ mod tests {
     #[test]
     fn tier_generation_including_max_amount() {
         let max_amount = Amount::from_msats(16);
-        let denominations = Tiered::gen_denominations(max_amount);
+        let denominations = Tiered::gen_denominations(2, max_amount);
 
         // should produce [1, 2, 4, 8, 16]
-        assert_eq!(denominations.tiers().collect::<Vec<&Amount>>().len(), 5);
+        assert_eq!(denominations.tiers().count(), 5);
+    }
+
+    #[test]
+    fn tier_generation_base_10() {
+        let max_amount = Amount::from_msats(10000);
+        let denominations = Tiered::gen_denominations(10, max_amount);
+
+        // should produce [1, 10, 100, 1000, 10_000]
+        assert_eq!(denominations.tiers().count(), 5);
     }
 }

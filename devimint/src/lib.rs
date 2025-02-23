@@ -1,236 +1,62 @@
-use std::collections::HashMap;
-use std::env;
-use std::future::Future;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+#![deny(clippy::pedantic)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::explicit_deref_methods)]
+#![allow(clippy::implicit_hasher)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::large_futures)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::return_self_not_must_use)]
+#![allow(clippy::too_many_lines)]
 
-use anyhow::{Context, Result};
-use bitcoincore_rpc::RpcApi;
-use federation::{run_config_gen, Federation};
-use fedimint_client::module::gen::{ClientModuleGenRegistry, DynClientModuleGen};
-use fedimint_client_legacy::modules::mint::MintClientGen;
-use fedimint_client_legacy::{module_decode_stubs, UserClient, UserClientConfig};
-use fedimint_core::config::load_from_file;
-use fedimint_core::db::Database;
-use fedimint_ln_client::LightningClientGen;
-use fedimint_logging::LOG_DEVIMINT;
-use fedimint_wallet_client::WalletClientGen;
-use tokio::fs;
-use tracing::info;
+use std::ffi;
 
+use clap::Parser as _;
+use cli::cleanup_on_exit;
+use devfed::DevJitFed;
+pub use devfed::{DevFed, dev_fed};
+pub use external::{
+    ExternalDaemons, LightningNode, Lightningd, LightningdProcessHandle, Lnd, external_daemons,
+};
+use futures::Future;
+pub use gatewayd::Gatewayd;
+use tests::log_binary_versions;
+use util::ProcessManager;
+
+pub mod cli;
+pub mod devfed;
+pub mod envs;
+pub mod external;
+pub mod federation;
+pub mod gatewayd;
+pub mod tests;
 pub mod util;
 pub mod vars;
-use util::*;
-use vars::utf8;
+pub mod version_constants;
 
-mod external;
-pub use external::{
-    external_daemons, open_channel, Bitcoind, Electrs, Esplora, ExternalDaemons, LightningNode,
-    Lightningd, Lnd,
-};
+pub async fn run_devfed_test<F, FF>(f: F) -> anyhow::Result<()>
+where
+    F: FnOnce(DevJitFed, ProcessManager) -> FF,
+    FF: Future<Output = anyhow::Result<()>>,
+{
+    let args = cli::CommonArgs::parse_from::<_, ffi::OsString>(vec![]);
 
-pub mod federation;
+    let (process_mgr, task_group) = cli::setup(args).await?;
+    log_binary_versions().await?;
+    let dev_fed = devfed::DevJitFed::new(&process_mgr, false)?;
+    // workaround https://github.com/tokio-rs/tokio/issues/6463
+    // by waiting on all jits to complete, we make it less likely
+    // that something is not finished yet and will block in `on_block`
+    let _ = dev_fed.finalize(&process_mgr).await;
+    let res = cleanup_on_exit(f(dev_fed.clone(), process_mgr.clone()), task_group).await;
+    dev_fed.fast_terminate().await;
+    res?;
 
-pub struct DevFed {
-    pub bitcoind: Bitcoind,
-    pub cln: Lightningd,
-    pub lnd: Lnd,
-    pub fed: Federation,
-    pub gw_cln: Gatewayd,
-    pub gw_lnd: Gatewayd,
-    pub electrs: Electrs,
-    pub esplora: Esplora,
-    pub faucet: Faucet,
-}
-
-#[derive(Clone)]
-pub struct Gatewayd {
-    _process: ProcessHandle,
-    pub ln: Option<LightningNode>,
-}
-
-impl Gatewayd {
-    pub async fn new(process_mgr: &ProcessManager, ln: LightningNode) -> Result<Self> {
-        let ln_name = ln.name();
-        let test_dir = &process_mgr.globals.FM_TEST_DIR;
-        let gateway_env: HashMap<String, String> = match ln {
-            LightningNode::Cln(_) => HashMap::from_iter([
-                (
-                    "FM_GATEWAY_DATA_DIR".to_owned(),
-                    format!("{}/gw-cln", utf8(test_dir)),
-                ),
-                (
-                    "FM_GATEWAY_LISTEN_ADDR".to_owned(),
-                    "127.0.0.1:8175".to_owned(),
-                ),
-                (
-                    "FM_GATEWAY_API_ADDR".to_owned(),
-                    "http://127.0.0.1:8175".to_owned(),
-                ),
-            ]),
-            LightningNode::Lnd(_) => HashMap::from_iter([
-                (
-                    "FM_GATEWAY_DATA_DIR".to_owned(),
-                    format!("{}/gw-lnd", utf8(test_dir)),
-                ),
-                (
-                    "FM_GATEWAY_LISTEN_ADDR".to_owned(),
-                    "127.0.0.1:28175".to_owned(),
-                ),
-                (
-                    "FM_GATEWAY_API_ADDR".to_owned(),
-                    "http://127.0.0.1:28175".to_owned(),
-                ),
-            ]),
-        };
-        let process = process_mgr
-            .spawn_daemon(
-                &format!("gatewayd-{ln_name}"),
-                cmd!("gatewayd", ln_name).envs(gateway_env),
-            )
-            .await?;
-
-        Ok(Self {
-            ln: Some(ln),
-            _process: process,
-        })
-    }
-
-    pub fn set_lightning_node(&mut self, ln_node: LightningNode) {
-        self.ln = Some(ln_node);
-    }
-
-    pub async fn stop_lightning_node(&mut self) -> Result<()> {
-        match self.ln.take() {
-            Some(LightningNode::Lnd(lnd)) => lnd.kill().await,
-            Some(LightningNode::Cln(cln)) => cln.kill().await,
-            None => Err(anyhow::anyhow!(
-                "Cannot stop an already stopped Lightning Node"
-            )),
-        }
-    }
-
-    pub async fn cmd(&self) -> Command {
-        match &self.ln {
-            Some(LightningNode::Cln(_)) => {
-                cmd!("gateway-cli", "--rpcpassword=theresnosecondbest")
-            }
-            Some(LightningNode::Lnd(_)) => {
-                cmd!(
-                    "gateway-cli",
-                    "--rpcpassword=theresnosecondbest",
-                    "-a",
-                    "http://127.0.0.1:28175"
-                )
-            }
-            None => {
-                panic!("Cannot execute command when gateway is disconnected from Lightning Node");
-            }
-        }
-    }
-
-    pub async fn gateway_pub_key(&self) -> Result<String> {
-        let info = cmd!(self, "info").out_json().await?;
-        let gateway_pub_key = info["federations"][0]["registration"]["gateway_pub_key"]
-            .as_str()
-            .context("gateway_pub_key must be a string")?
-            .to_owned();
-        Ok(gateway_pub_key)
-    }
-
-    pub async fn connect_fed(&self, fed: &Federation) -> Result<()> {
-        let connect_str = poll_value("connect info", || async {
-            match cmd!(fed, "dev", "connect-info").out_json().await {
-                Ok(info) => Ok(Some(
-                    info["connect_info"]
-                        .as_str()
-                        .context("connect_info must be string")?
-                        .to_owned(),
-                )),
-                Err(_) => Ok(None),
-            }
-        })
-        .await?;
-        poll("gateway connect-fed", || async {
-            Ok(cmd!(self, "connect-fed", connect_str.clone())
-                .run()
-                .await
-                .is_ok())
-        })
-        .await?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct Faucet {
-    _process: ProcessHandle,
-}
-
-impl Faucet {
-    pub async fn new(process_mgr: &ProcessManager) -> Result<Self> {
-        let connect_string =
-            fs::read_to_string(process_mgr.globals.FM_DATA_DIR.join("client-connect")).await?;
-
-        Ok(Self {
-            _process: process_mgr
-                .spawn_daemon(
-                    "faucet",
-                    cmd!("faucet", "--connect-string={connect_string}"),
-                )
-                .await?,
-        })
-    }
-}
-
-pub async fn dev_fed(process_mgr: &ProcessManager) -> Result<DevFed> {
-    let start_time = fedimint_core::time::now();
-    let bitcoind = Bitcoind::new(process_mgr).await?;
-    let ((cln, lnd, gw_cln, gw_lnd, faucet), electrs, esplora, fed) = tokio::try_join!(
-        async {
-            let (cln, lnd) = tokio::try_join!(
-                Lightningd::new(process_mgr, bitcoind.clone()),
-                Lnd::new(process_mgr, bitcoind.clone())
-            )?;
-            info!(LOG_DEVIMINT, "lightning started");
-            let (gw_cln, gw_lnd, _, faucet) = tokio::try_join!(
-                Gatewayd::new(process_mgr, LightningNode::Cln(cln.clone())),
-                Gatewayd::new(process_mgr, LightningNode::Lnd(lnd.clone())),
-                open_channel(&bitcoind, &cln, &lnd),
-                Faucet::new(process_mgr)
-            )?;
-            info!(LOG_DEVIMINT, "gateways started");
-            Ok((cln, lnd, gw_cln, gw_lnd, faucet))
-        },
-        Electrs::new(process_mgr, bitcoind.clone()),
-        Esplora::new(process_mgr, bitcoind.clone()),
-        async {
-            let fed_size = process_mgr.globals.FM_FED_SIZE;
-            let members = run_config_gen(process_mgr, fed_size, true).await?;
-            info!(LOG_DEVIMINT, "config gen done");
-            Federation::new(process_mgr, bitcoind.clone(), members).await
-        },
-    )?;
-    info!(LOG_DEVIMINT, "federation and gateways started");
-    tokio::try_join!(gw_cln.connect_fed(&fed), gw_lnd.connect_fed(&fed))?;
-    fed.await_gateways_registered().await?;
-    info!(LOG_DEVIMINT, "gateways registered");
-    fed.use_gateway(&gw_cln).await?;
-    info!(
-        LOG_DEVIMINT,
-        "starting dev federation took {:?}",
-        start_time.elapsed()?
-    );
-    Ok(DevFed {
-        bitcoind,
-        cln,
-        lnd,
-        faucet,
-        fed,
-        gw_cln,
-        gw_lnd,
-        electrs,
-        esplora,
-    })
+    Ok(())
 }

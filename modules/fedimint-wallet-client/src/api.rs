@@ -1,19 +1,37 @@
-use bitcoin::Address;
-use fedimint_core::api::{FederationApiExt, FederationResult, IModuleFederationApi};
-use fedimint_core::module::ApiRequestErased;
-use fedimint_core::query::EventuallyConsistent;
+use bitcoin::{Address, Amount};
+use fedimint_api_client::api::{FederationApiExt, FederationResult, IModuleFederationApi};
+use fedimint_core::envs::BitcoinRpcConfig;
+use fedimint_core::module::{ApiAuth, ApiRequestErased, ModuleConsensusVersion};
 use fedimint_core::task::{MaybeSend, MaybeSync};
-use fedimint_core::{apply, async_trait_maybe_send, NumPeers};
-use fedimint_wallet_common::PegOutFees;
+use fedimint_core::{PeerId, apply, async_trait_maybe_send};
+use fedimint_wallet_common::endpoint_constants::{
+    ACTIVATE_CONSENSUS_VERSION_VOTING_ENDPOINT, BITCOIN_KIND_ENDPOINT, BITCOIN_RPC_CONFIG_ENDPOINT,
+    BLOCK_COUNT_ENDPOINT, MODULE_CONSENSUS_VERSION_ENDPOINT, PEG_OUT_FEES_ENDPOINT,
+    UTXO_CONFIRMED_ENDPOINT, WALLET_SUMMARY_ENDPOINT,
+};
+use fedimint_wallet_common::{PegOutFees, WalletSummary};
 
 #[apply(async_trait_maybe_send!)]
 pub trait WalletFederationApi {
-    async fn fetch_consensus_block_height(&self) -> FederationResult<u64>;
+    async fn module_consensus_version(&self) -> FederationResult<ModuleConsensusVersion>;
+
+    async fn fetch_consensus_block_count(&self) -> FederationResult<u64>;
+
     async fn fetch_peg_out_fees(
         &self,
         address: &Address,
-        amount: bitcoin::Amount,
+        amount: Amount,
     ) -> FederationResult<Option<PegOutFees>>;
+
+    async fn fetch_bitcoin_rpc_kind(&self, peer_id: PeerId) -> FederationResult<String>;
+
+    async fn fetch_bitcoin_rpc_config(&self, auth: ApiAuth) -> FederationResult<BitcoinRpcConfig>;
+
+    async fn fetch_wallet_summary(&self) -> FederationResult<WalletSummary>;
+
+    async fn is_utxo_confirmed(&self, outpoint: bitcoin::OutPoint) -> FederationResult<bool>;
+
+    async fn activate_consensus_version_voting(&self, auth: ApiAuth) -> FederationResult<()>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -21,10 +39,43 @@ impl<T: ?Sized> WalletFederationApi for T
 where
     T: IModuleFederationApi + MaybeSend + MaybeSync + 'static,
 {
-    async fn fetch_consensus_block_height(&self) -> FederationResult<u64> {
-        self.request_with_strategy(
-            EventuallyConsistent::new(self.all_members().one_honest()),
-            "block_height".to_string(),
+    async fn module_consensus_version(&self) -> FederationResult<ModuleConsensusVersion> {
+        let response = self
+            .request_current_consensus(
+                MODULE_CONSENSUS_VERSION_ENDPOINT.to_string(),
+                ApiRequestErased::default(),
+            )
+            .await;
+
+        if let Err(e) = &response {
+            if e.any_peer_error_method_not_found() {
+                return Ok(ModuleConsensusVersion::new(2, 0));
+            }
+        }
+
+        response
+    }
+
+    async fn is_utxo_confirmed(&self, outpoint: bitcoin::OutPoint) -> FederationResult<bool> {
+        let res = self
+            .request_current_consensus(
+                UTXO_CONFIRMED_ENDPOINT.to_string(),
+                ApiRequestErased::new(outpoint),
+            )
+            .await;
+
+        if let Err(e) = &res {
+            if e.any_peer_error_method_not_found() {
+                return Ok(false);
+            }
+        }
+
+        res
+    }
+
+    async fn fetch_consensus_block_count(&self) -> FederationResult<u64> {
+        self.request_current_consensus(
+            BLOCK_COUNT_ENDPOINT.to_string(),
             ApiRequestErased::default(),
         )
         .await
@@ -33,12 +84,46 @@ where
     async fn fetch_peg_out_fees(
         &self,
         address: &Address,
-        amount: bitcoin::Amount,
+        amount: Amount,
     ) -> FederationResult<Option<PegOutFees>> {
-        self.request_with_strategy(
-            EventuallyConsistent::new(self.all_members().threshold()),
-            "peg_out_fees".to_string(),
+        self.request_current_consensus(
+            PEG_OUT_FEES_ENDPOINT.to_string(),
             ApiRequestErased::new((address, amount.to_sat())),
+        )
+        .await
+    }
+
+    async fn fetch_bitcoin_rpc_kind(&self, peer_id: PeerId) -> FederationResult<String> {
+        self.request_single_peer_federation(
+            BITCOIN_KIND_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
+            peer_id,
+        )
+        .await
+    }
+
+    async fn fetch_bitcoin_rpc_config(&self, auth: ApiAuth) -> FederationResult<BitcoinRpcConfig> {
+        self.request_admin(
+            BITCOIN_RPC_CONFIG_ENDPOINT,
+            ApiRequestErased::default(),
+            auth,
+        )
+        .await
+    }
+
+    async fn fetch_wallet_summary(&self) -> FederationResult<WalletSummary> {
+        self.request_current_consensus(
+            WALLET_SUMMARY_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
+        )
+        .await
+    }
+
+    async fn activate_consensus_version_voting(&self, auth: ApiAuth) -> FederationResult<()> {
+        self.request_admin(
+            ACTIVATE_CONSENSUS_VERSION_VOTING_ENDPOINT,
+            ApiRequestErased::default(),
+            auth,
         )
         .await
     }

@@ -1,39 +1,52 @@
 [package]
 name = "fedimint-wallet-client"
-version = "0.1.0"
-authors = ["The Fedimint Developers"]
-edition = "2021"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
 description = "fedimint-wallet is a n on-chain bitcoin wallet module. It uses a key-value store and is not a standard HD wallet."
-license = "MIT"
+license = { workspace = true }
+readme = { workspace = true }
+repository = { workspace = true }
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[features]
+default = []
+cli = ["dep:clap"]
 
 [lib]
 name = "fedimint_wallet_client"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.66"
-aquamarine = "0.3.1"
-async-stream = "0.3.5"
-async-trait = "0.1"
-bitcoin = { version = "0.29.2", features = [ "rand", "serde"] }
-erased-serde = "0.3"
-fedimint-bitcoind = { path = "../../fedimint-bitcoind", default-features = false, features = ["esplora-client", "bitcoincore-rpc"] }
-fedimint-client = { path = "../../fedimint-client" }
-fedimint-core = { path = "../../fedimint-core" }
-fedimint-wallet-common ={ path = "../fedimint-wallet-common" }
-futures = "0.3"
-miniscript = { version = "7.0.0", git = "https://github.com/rust-bitcoin/rust-miniscript/", rev = "2f1535e470c75fad85dbad8633986aae36a89a92", features = [ "compiler", "serde" ] }
-impl-tools = "0.8.0"
-rand = "0.8"
-secp256k1 = { version = "0.24.2", features = [ "serde" ] }
-serde = { version = "1.0.149", features = [ "derive" ] }
-strum = "0.24"
-strum_macros = "0.24"
-thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = ["sync", "rt"] }
-tracing ="0.1.37"
-url = "2.3.1"
-validator = { version = "0.16", features = ["derive"] }
+anyhow = { workspace = true }
+aquamarine = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+clap = { workspace = true, optional = true }
+erased-serde = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-derive-secret = { workspace = true }
+fedimint-eventlog = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-wallet-common = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
-[dev-dependencies]
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+fedimint-bitcoind = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+fedimint-bitcoind = { version = "=0.7.0-alpha", path = "../../fedimint-bitcoind", default-features = false, features = [
+  "esplora-client",
+] }

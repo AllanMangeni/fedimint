@@ -1,10 +1,25 @@
 /target/
+/target-nix/
+/hfuzz_target/
+/hfuzz_workspace/
+/target-comp-bench/
+/tmp/
 # in case it's a symlink
 /target
+/target-nix
+/hfuzz_target
+/hfuzz_workspace
+/target-comp-bench
+/tmp
 
 /result
+/.shrc.local
 .idea
 .tmpenv
 .direnv
 .vscode
 .DS_Store
+
+.cargo/registry
+.cargo/.package-cache
+.cargo/.package-cache-mutate

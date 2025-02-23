@@ -1,141 +1,186 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use erased_serde::Serialize;
-use fedimint_client_legacy::db as ClientRange;
-use fedimint_client_legacy::ln::db as ClientLightningRange;
-use fedimint_client_legacy::mint::db as ClientMintRange;
-use fedimint_client_legacy::wallet::db as ClientWalletRange;
-use fedimint_core::config::ServerModuleGenRegistry;
-use fedimint_core::db::notifications::Notifications;
-use fedimint_core::db::{DatabaseTransaction, DatabaseVersionKey, SingleUseDatabaseTransaction};
+use fedimint_client::db::{ClientConfigKey, OperationLogKeyPrefix};
+use fedimint_client::module_init::ClientModuleInitRegistry;
+use fedimint_client_module::oplog::OperationLogEntry;
+use fedimint_core::config::{ClientConfig, CommonModuleInitRegistry};
+use fedimint_core::core::ModuleKind;
+use fedimint_core::db::{
+    Database, DatabaseTransaction, DatabaseVersionKey, IDatabaseTransactionOpsCore,
+    IDatabaseTransactionOpsCoreTyped,
+};
 use fedimint_core::encoding::Encodable;
-use fedimint_core::module::DynServerModuleGen;
-use fedimint_core::module::__reexports::serde_json;
-use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::{push_db_key_items, push_db_pair_items, push_db_pair_items_no_serde};
-use fedimint_ln_server::LightningGen;
-use fedimint_mint_server::MintGen;
+use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
+use fedimint_core::push_db_pair_items;
+use fedimint_gateway_server::Gateway;
 use fedimint_rocksdb::RocksDbReadOnly;
-use fedimint_server::config::io::read_server_config;
 use fedimint_server::config::ServerConfig;
-use fedimint_server::db as ConsensusRange;
-use fedimint_wallet_server::WalletGen;
+use fedimint_server::config::io::read_server_config;
+use fedimint_server::consensus::db as ConsensusRange;
+use fedimint_server::core::{ServerModuleInitRegistry, ServerModuleInitRegistryExt};
+use fedimint_server::net::api::announcement::ApiAnnouncementPrefix;
 use futures::StreamExt;
 use strum::IntoEnumIterator;
+
+macro_rules! push_db_pair_items_no_serde {
+    ($dbtx:ident, $prefix_type:expr_2021, $key_type:ty, $value_type:ty, $map:ident, $key_literal:literal) => {
+        let db_items = IDatabaseTransactionOpsCoreTyped::find_by_prefix($dbtx, &$prefix_type)
+            .await
+            .map(|(key, val)| {
+                (
+                    Encodable::consensus_encode_to_hex(&key),
+                    SerdeWrapper::from_encodable(&val),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .await;
+
+        $map.insert($key_literal.to_string(), Box::new(db_items));
+    };
+}
 
 #[derive(Debug, serde::Serialize)]
 struct SerdeWrapper(#[serde(with = "hex::serde")] Vec<u8>);
 
 impl SerdeWrapper {
-    fn from_encodable<T: Encodable>(e: T) -> SerdeWrapper {
-        let mut bytes = vec![];
-        e.consensus_encode(&mut bytes)
-            .expect("Write to vec can't fail");
-        SerdeWrapper(bytes)
+    fn from_encodable<T: Encodable>(e: &T) -> SerdeWrapper {
+        SerdeWrapper(e.consensus_encode_to_vec())
     }
 }
 
 /// Structure to hold the deserialized structs from the database.
 /// Also includes metadata on which sections of the database to read.
-pub struct DatabaseDump<'a> {
+pub struct DatabaseDump {
     serialized: BTreeMap<String, Box<dyn Serialize>>,
-    read_only: DatabaseTransaction<'a>,
+    read_only_db: Database,
     modules: Vec<String>,
     prefixes: Vec<String>,
-    cfg: Option<ServerConfig>,
-    module_inits: ServerModuleGenRegistry,
+    server_cfg: Option<ServerConfig>,
+    module_inits: ServerModuleInitRegistry,
+    client_cfg: Option<ClientConfig>,
+    client_module_inits: ClientModuleInitRegistry,
 }
 
-impl<'a> DatabaseDump<'a> {
-    pub fn new(
+impl DatabaseDump {
+    pub async fn new(
         cfg_dir: PathBuf,
         data_dir: String,
         password: String,
+        module_inits: ServerModuleInitRegistry,
+        client_module_inits: ClientModuleInitRegistry,
         modules: Vec<String>,
         prefixes: Vec<String>,
-    ) -> DatabaseDump<'a> {
-        let read_only = match RocksDbReadOnly::open_read_only(data_dir) {
-            Ok(db) => db,
-            Err(_) => {
-                panic!("Error reading RocksDB database. Quitting...");
+    ) -> anyhow::Result<DatabaseDump> {
+        let Ok(read_only_rocks_db) = RocksDbReadOnly::open_read_only(data_dir.clone()) else {
+            panic!("Error reading RocksDB database. Quitting...");
+        };
+
+        let read_only_db = Database::new(read_only_rocks_db, ModuleRegistry::default());
+
+        let (server_cfg, client_cfg, decoders) = if let Ok(cfg) =
+            read_server_config(&password, &cfg_dir).context("Failed to read server config")
+        {
+            // Successfully read the server's config, that means this database is a server
+            // db
+            let decoders = module_inits
+                .available_decoders(cfg.iter_module_instances())
+                .unwrap()
+                .with_fallback();
+            (Some(cfg), None, decoders)
+        } else {
+            // Check if this database is a client database by reading the `ClientConfig`
+            // from the database.
+
+            let mut dbtx = read_only_db.begin_transaction_nc().await;
+            let client_cfg_or = dbtx.get_value(&ClientConfigKey).await;
+
+            match client_cfg_or {
+                Some(client_cfg) => {
+                    // Successfully read the client config, that means this database is a client db
+                    let kinds = client_cfg.modules.iter().map(|(k, v)| (*k, &v.kind));
+                    let decoders = client_module_inits
+                        .available_decoders(kinds)
+                        .unwrap()
+                        .with_fallback();
+                    let client_cfg = client_cfg.redecode_raw(&decoders)?;
+                    (None, Some(client_cfg), decoders)
+                }
+                _ => (None, None, ModuleDecoderRegistry::default()),
             }
         };
-        let single_use = SingleUseDatabaseTransaction::new(read_only);
 
-        // leak here is OK, it only happens once.
-        let notifications = Box::leak(Box::new(Notifications::new()));
-        if modules.contains(&"client".to_string()) {
-            let dbtx = DatabaseTransaction::new(
-                Box::new(single_use),
-                ModuleDecoderRegistry::default(),
-                notifications,
-            );
-            return DatabaseDump {
-                serialized: BTreeMap::new(),
-                read_only: dbtx,
-                modules,
-                prefixes,
-                cfg: None,
-                module_inits: Default::default(),
-            };
-        }
-
-        let module_inits = ServerModuleGenRegistry::from(vec![
-            DynServerModuleGen::from(WalletGen),
-            DynServerModuleGen::from(MintGen),
-            DynServerModuleGen::from(LightningGen),
-        ]);
-
-        let cfg = read_server_config(&password, cfg_dir).unwrap();
-        let decoders = module_inits.decoders(cfg.iter_module_instances()).unwrap();
-        let dbtx = DatabaseTransaction::new(Box::new(single_use), decoders, notifications);
-
-        DatabaseDump {
+        Ok(DatabaseDump {
             serialized: BTreeMap::new(),
-            read_only: dbtx,
+            read_only_db: read_only_db.with_decoders(decoders),
             modules,
             prefixes,
-            cfg: Some(cfg),
+            server_cfg,
             module_inits,
-        }
+            client_module_inits,
+            client_cfg,
+        })
     }
 }
 
-impl<'a> DatabaseDump<'a> {
-    /// Prints the contents of the BTreeMap to a pretty JSON string
+impl DatabaseDump {
+    /// Prints the contents of the `BTreeMap` to a pretty JSON string
     fn print_database(&self) {
         let json = serde_json::to_string_pretty(&self.serialized).unwrap();
         println!("{json}");
     }
 
-    /// Iterates through all the specified ranges in the database and retrieves
-    /// the data for each range. Prints serialized contents at the end.
-    pub async fn dump_database(&mut self) {
-        if self.modules.is_empty() || self.modules.contains(&"consensus".to_string()) {
-            self.retrieve_consensus_data().await;
+    async fn serialize_module(
+        &mut self,
+        module_id: &u16,
+        kind: &ModuleKind,
+        inits: CommonModuleInitRegistry,
+    ) -> anyhow::Result<()> {
+        if !self.modules.is_empty() && !self.modules.contains(&kind.to_string()) {
+            return Ok(());
         }
+        let mut dbtx = self.read_only_db.begin_transaction_nc().await;
+        let db_version = dbtx.get_value(&DatabaseVersionKey(*module_id)).await;
+        let mut isolated_dbtx = dbtx.to_ref_with_prefix_module_id(*module_id).0;
 
-        let cfg = &self.cfg;
-        if let Some(cfg) = cfg {
-            for (module_id, module_cfg) in &cfg.consensus.modules {
-                let kind = &module_cfg.kind;
+        match inits.get(kind) {
+            None => {
+                tracing::warn!(module_id, %kind, "Detected configuration for unsupported module");
 
-                let Some(init) = self.module_inits.get(kind) else {
-                    panic!("Detected configuration for unsupported module kind: {kind}")
-                };
+                let mut module_serialized = BTreeMap::new();
+                let filtered_prefixes = (0u8..=255).filter(|f| {
+                    self.prefixes.is_empty()
+                        || self.prefixes.contains(&f.to_string().to_lowercase())
+                });
 
-                if !self.modules.is_empty() && !self.modules.contains(&kind.to_string()) {
-                    continue;
+                let isolated_dbtx = &mut isolated_dbtx;
+
+                for prefix in filtered_prefixes {
+                    let db_items = isolated_dbtx
+                        .raw_find_by_prefix(&[prefix])
+                        .await?
+                        .map(|(k, v)| {
+                            (
+                                k.consensus_encode_to_hex(),
+                                Box::new(v.consensus_encode_to_hex()),
+                            )
+                        })
+                        .collect::<BTreeMap<String, Box<_>>>()
+                        .await;
+
+                    module_serialized.extend(db_items);
                 }
-
-                let mut isolated_dbtx = self.read_only.with_module_prefix(*module_id);
+                self.serialized
+                    .insert(format!("{kind}-{module_id}"), Box::new(module_serialized));
+            }
+            Some(init) => {
                 let mut module_serialized = init
-                    .dump_database(&mut isolated_dbtx, self.prefixes.clone())
+                    .dump_database(&mut isolated_dbtx.to_ref_nc(), self.prefixes.clone())
                     .await
                     .collect::<BTreeMap<String, _>>();
 
-                let db_version = isolated_dbtx.get_value(&DatabaseVersionKey).await;
                 if let Some(db_version) = db_version {
                     module_serialized.insert("Version".to_string(), Box::new(db_version));
                 } else {
@@ -148,295 +193,153 @@ impl<'a> DatabaseDump<'a> {
             }
         }
 
-        // TODO: When the client is modularized, these don't need to be hardcoded
-        // anymore
-        if !self.modules.is_empty() && self.modules.contains(&"client".to_string()) {
-            self.retrieve_client_data().await;
-            self.retrieve_ln_client_data().await;
-            self.retrieve_mint_client_data().await;
-            self.retrieve_wallet_client_data().await;
+        Ok(())
+    }
+
+    async fn serialize_gateway(&mut self) -> anyhow::Result<()> {
+        let mut dbtx = self.read_only_db.begin_transaction_nc().await;
+        let gateway_serialized = Gateway::dump_database(&mut dbtx, self.prefixes.clone()).await;
+        self.serialized
+            .insert("gateway".to_string(), Box::new(gateway_serialized));
+        Ok(())
+    }
+
+    /// Iterates through all the specified ranges in the database and retrieves
+    /// the data for each range. Prints serialized contents at the end.
+    pub async fn dump_database(&mut self) -> anyhow::Result<()> {
+        if let Some(cfg) = self.server_cfg.clone() {
+            if self.modules.is_empty() || self.modules.contains(&"consensus".to_string()) {
+                self.retrieve_consensus_data().await;
+            }
+
+            for (module_id, module_cfg) in &cfg.consensus.modules {
+                let kind = &module_cfg.kind;
+                self.serialize_module(module_id, kind, self.module_inits.to_common())
+                    .await?;
+            }
+
+            self.print_database();
+            return Ok(());
         }
 
+        if let Some(cfg) = self.client_cfg.clone() {
+            self.serialized
+                .insert("Client Config".into(), Box::new(cfg.to_json()));
+
+            for (module_id, module_cfg) in &cfg.modules {
+                let kind = &module_cfg.kind;
+                let mut modules = Vec::new();
+                if let Some(module) = self.client_module_inits.get(kind) {
+                    modules.push(module.to_dyn_common());
+                }
+
+                let registry = CommonModuleInitRegistry::from(modules);
+                self.serialize_module(module_id, kind, registry).await?;
+            }
+
+            {
+                let mut dbtx = self.read_only_db.begin_transaction_nc().await;
+                Self::write_serialized_client_operation_log(&mut self.serialized, &mut dbtx).await;
+            }
+
+            self.print_database();
+            return Ok(());
+        }
+
+        self.serialize_gateway().await?;
         self.print_database();
+
+        Ok(())
     }
 
     /// Iterates through each of the prefixes within the consensus range and
     /// retrieves the corresponding data.
     async fn retrieve_consensus_data(&mut self) {
-        let mut consensus: BTreeMap<String, Box<dyn Serialize>> = BTreeMap::new();
-        let dbtx = &mut self.read_only;
-        let prefix_names = &self.prefixes;
-
-        let filtered_prefixes = ConsensusRange::DbKeyPrefix::iter().filter(|f| {
-            prefix_names.is_empty() || prefix_names.contains(&f.to_string().to_lowercase())
+        let filtered_prefixes = ConsensusRange::DbKeyPrefix::iter().filter(|prefix| {
+            self.prefixes.is_empty() || self.prefixes.contains(&prefix.to_string().to_lowercase())
         });
+        let mut dbtx = self.read_only_db.begin_transaction_nc().await;
+        let mut consensus: BTreeMap<String, Box<dyn Serialize>> = BTreeMap::new();
+
         for table in filtered_prefixes {
-            match table {
-                ConsensusRange::DbKeyPrefix::AcceptedTransaction => {
-                    push_db_pair_items_no_serde!(
-                        dbtx,
-                        ConsensusRange::AcceptedTransactionKeyPrefix,
-                        ConsensusRange::AcceptedTransactionKey,
-                        fedimint_server::consensus::AcceptedTransaction,
-                        consensus,
-                        "Accepted Transactions"
-                    );
-                }
-                ConsensusRange::DbKeyPrefix::DropPeer => {
-                    push_db_key_items!(
-                        dbtx,
-                        ConsensusRange::DropPeerKeyPrefix,
-                        ConsensusRange::DropPeerKey,
-                        consensus,
-                        "Dropped Peers"
-                    );
-                }
-                ConsensusRange::DbKeyPrefix::RejectedTransaction => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ConsensusRange::RejectedTransactionKeyPrefix,
-                        ConsensusRange::RejectedTransactionKey,
-                        String,
-                        consensus,
-                        "Rejected Transactions"
-                    );
-                }
-                ConsensusRange::DbKeyPrefix::EpochHistory => {
-                    push_db_pair_items_no_serde!(
-                        dbtx,
-                        ConsensusRange::EpochHistoryKeyPrefix,
-                        ConsensusRange::EpochHistoryKey,
-                        fedimint_core::epoch::EpochHistory,
-                        consensus,
-                        "Epoch History"
-                    );
-                }
-                ConsensusRange::DbKeyPrefix::LastEpoch => {
-                    let last_epoch = dbtx.get_value(&ConsensusRange::LastEpochKey).await;
-                    if let Some(last_epoch) = last_epoch {
-                        consensus.insert("LastEpoch".to_string(), Box::new(last_epoch));
-                    }
-                }
-                ConsensusRange::DbKeyPrefix::ClientConfigSignature => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ConsensusRange::ClientConfigSignatureKeyPrefix,
-                        ConsensusRange::ClientConfigSignatureKey,
-                        fedimint_core::epoch::SerdeSignature,
-                        consensus,
-                        "Client Config Signature"
-                    );
-                }
-                ConsensusRange::DbKeyPrefix::ConsensusUpgrade => {
-                    let upgrade = dbtx.get_value(&ConsensusRange::ConsensusUpgradeKey).await;
-                    if let Some(upgrade) = upgrade {
-                        consensus.insert("ConsensusUpgrade".to_string(), Box::new(upgrade));
-                    }
-                }
-                ConsensusRange::DbKeyPrefix::ClientConfigDownload => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ConsensusRange::ClientConfigDownloadKeyPrefix,
-                        ConsensusRange::ClientConfigDownloadKey,
-                        u64,
-                        consensus,
-                        "Client Config Download"
-                    );
-                }
-                // Module is a global prefix for all module data
-                ConsensusRange::DbKeyPrefix::Module => {}
-            }
+            Self::write_serialized_consensus_range(table, &mut dbtx, &mut consensus).await;
         }
 
         self.serialized
             .insert("Consensus".to_string(), Box::new(consensus));
     }
 
-    /// Iterates through each of the prefixes within the lightning client range
-    /// and retrieves the corresponding data.
-    async fn retrieve_ln_client_data(&mut self) {
-        let mut ln_client: BTreeMap<String, Box<dyn Serialize>> = BTreeMap::new();
-        let dbtx = &mut self.read_only;
-        let prefix_names = &self.prefixes;
-        let filtered_prefixes = ClientLightningRange::DbKeyPrefix::iter().filter(|f| {
-            prefix_names.is_empty() || prefix_names.contains(&f.to_string().to_lowercase())
-        });
-        for table in filtered_prefixes {
-            match table {
-                ClientLightningRange::DbKeyPrefix::ConfirmedInvoice => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientLightningRange::ConfirmedInvoiceKeyPrefix,
-                        ClientLightningRange::ConfirmedInvoiceKey,
-                        fedimint_client_legacy::ln::incoming::ConfirmedInvoice,
-                        ln_client,
-                        "Confirmed Invoices"
-                    );
-                }
-                ClientLightningRange::DbKeyPrefix::LightningGateway => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientLightningRange::LightningGatewayKeyPrefix,
-                        ClientLightningRange::LightningGatewayKey,
-                        fedimint_ln_server::common::LightningGateway,
-                        ln_client,
-                        "Lightning Gateways"
-                    );
-                }
-                ClientLightningRange::DbKeyPrefix::OutgoingContractAccount => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientLightningRange::OutgoingContractAccountKeyPrefix,
-                        ClientLightningRange::OutgoingContractAccountKey,
-                        fedimint_client_legacy::ln::outgoing::OutgoingContractAccount,
-                        ln_client,
-                        "Outgoing Contract Accounts"
-                    );
-                }
-                ClientLightningRange::DbKeyPrefix::OutgoingPayment => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientLightningRange::OutgoingPaymentKeyPrefix,
-                        ClientLightningRange::OutgoingPaymentKey,
-                        fedimint_client_legacy::ln::outgoing::OutgoingContractData,
-                        ln_client,
-                        "Outgoing Payments"
-                    );
-                }
-                ClientLightningRange::DbKeyPrefix::OutgoingPaymentClaim => {
-                    push_db_key_items!(
-                        dbtx,
-                        ClientLightningRange::OutgoingPaymentClaimKeyPrefix,
-                        ClientLightningRange::OutgoingPaymentClaimKey,
-                        ln_client,
-                        "Outgoing Payment Claims"
-                    );
-                }
+    async fn write_serialized_consensus_range(
+        table: ConsensusRange::DbKeyPrefix,
+        dbtx: &mut DatabaseTransaction<'_>,
+        consensus: &mut BTreeMap<String, Box<dyn Serialize>>,
+    ) {
+        match table {
+            ConsensusRange::DbKeyPrefix::AcceptedItem => {
+                push_db_pair_items_no_serde!(
+                    dbtx,
+                    ConsensusRange::AcceptedItemPrefix,
+                    ConsensusRange::AcceptedItemKey,
+                    fedimint_server::consensus::AcceptedItem,
+                    consensus,
+                    "Accepted Items"
+                );
+            }
+            ConsensusRange::DbKeyPrefix::AcceptedTransaction => {
+                push_db_pair_items_no_serde!(
+                    dbtx,
+                    ConsensusRange::AcceptedTransactionKeyPrefix,
+                    ConsensusRange::AcceptedTransactionKey,
+                    fedimint_server::consensus::AcceptedTransaction,
+                    consensus,
+                    "Accepted Transactions"
+                );
+            }
+            ConsensusRange::DbKeyPrefix::SignedSessionOutcome => {
+                push_db_pair_items_no_serde!(
+                    dbtx,
+                    ConsensusRange::SignedSessionOutcomePrefix,
+                    ConsensusRange::SignedBlockKey,
+                    fedimint_server::consensus::SignedBlock,
+                    consensus,
+                    "Signed Blocks"
+                );
+            }
+            ConsensusRange::DbKeyPrefix::AlephUnits => {
+                push_db_pair_items_no_serde!(
+                    dbtx,
+                    ConsensusRange::AlephUnitsPrefix,
+                    ConsensusRange::AlephUnitsKey,
+                    Vec<u8>,
+                    consensus,
+                    "Aleph Units"
+                );
+            }
+            // Module is a global prefix for all module data
+            ConsensusRange::DbKeyPrefix::Module | ConsensusRange::DbKeyPrefix::ServerInfo => {}
+            ConsensusRange::DbKeyPrefix::ApiAnnouncements => {
+                push_db_pair_items_no_serde!(
+                    dbtx,
+                    ApiAnnouncementPrefix,
+                    ApiAnnouncementKey,
+                    fedimint_core::net::api_announcement::SignedApiAnnouncement,
+                    consensus,
+                    "API Announcements"
+                );
             }
         }
-
-        self.serialized
-            .insert("Client Lightning".to_string(), Box::new(ln_client));
     }
-
-    /// Iterates through each of the prefixes within the mint client range and
-    /// retrieves the corresponding data.
-    async fn retrieve_mint_client_data(&mut self) {
-        let mut mint_client: BTreeMap<String, Box<dyn Serialize>> = BTreeMap::new();
-        let dbtx = &mut self.read_only;
-        let prefix_names = &self.prefixes;
-        let filtered_prefixes = ClientMintRange::DbKeyPrefix::iter().filter(|f| {
-            prefix_names.is_empty() || prefix_names.contains(&f.to_string().to_lowercase())
-        });
-        for table in filtered_prefixes {
-            match table {
-                ClientMintRange::DbKeyPrefix::Note => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientMintRange::NoteKeyPrefix,
-                        ClientMintRange::NoteKey,
-                        fedimint_client_legacy::mint::SpendableNote,
-                        mint_client,
-                        "Notes"
-                    );
-                }
-                ClientMintRange::DbKeyPrefix::OutputFinalizationData => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientMintRange::OutputFinalizationKeyPrefix,
-                        ClientMintRange::OutputFinalizationKey,
-                        fedimint_client_legacy::mint::NoteIssuanceRequests,
-                        mint_client,
-                        "Output Finalization"
-                    );
-                }
-                ClientMintRange::DbKeyPrefix::PendingNotes => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientMintRange::PendingNotesKeyPrefix,
-                        ClientMintRange::PendingNotesKey,
-                        fedimint_core::TieredMulti<fedimint_client_legacy::mint::SpendableNote>,
-                        mint_client,
-                        "Pending Notes"
-                    );
-                }
-                ClientMintRange::DbKeyPrefix::NextECashNoteIndex => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientMintRange::NextECashNoteIndexKeyPrefix,
-                        ClientMintRange::NextECashNoteIndexKey,
-                        u64,
-                        mint_client,
-                        "Last e-cash note index"
-                    );
-                }
-                ClientMintRange::DbKeyPrefix::NotesPerDenomination => {
-                    let notes = dbtx
-                        .get_value(&ClientMintRange::NotesPerDenominationKey)
-                        .await;
-                    if let Some(notes) = notes {
-                        mint_client.insert("NotesPerDenomination".to_string(), Box::new(notes));
-                    }
-                }
-            }
-        }
-
-        self.serialized
-            .insert("Client Mint".to_string(), Box::new(mint_client));
-    }
-
-    /// Iterates through each of the prefixes within the wallet client range and
-    /// retrieves the corresponding data.
-    async fn retrieve_wallet_client_data(&mut self) {
-        let mut wallet_client: BTreeMap<String, Box<dyn Serialize>> = BTreeMap::new();
-        let dbtx = &mut self.read_only;
-        let prefix_names = &self.prefixes;
-        let filtered_prefixes = ClientWalletRange::DbKeyPrefix::iter().filter(|f| {
-            prefix_names.is_empty() || prefix_names.contains(&f.to_string().to_lowercase())
-        });
-        for table in filtered_prefixes {
-            match table {
-                ClientWalletRange::DbKeyPrefix::PegIn => {
-                    push_db_pair_items!(
-                        dbtx,
-                        ClientWalletRange::PegInPrefixKey,
-                        ClientWalletRange::PegInKey,
-                        [u8; 32],
-                        wallet_client,
-                        "Peg Ins"
-                    );
-                }
-            }
-        }
-
-        self.serialized
-            .insert("Client Wallet".to_string(), Box::new(wallet_client));
-    }
-
-    /// Iterates through each of the prefixes within the client range and
-    /// retrieves the corresponding data.
-    async fn retrieve_client_data(&mut self) {
-        let mut client: BTreeMap<String, Box<dyn Serialize>> = BTreeMap::new();
-        let prefix_names = &self.prefixes;
-        let filtered_prefixes = ClientRange::DbKeyPrefix::iter().filter(|f| {
-            prefix_names.is_empty() || prefix_names.contains(&f.to_string().to_lowercase())
-        });
-
-        for table in filtered_prefixes {
-            match table {
-                ClientRange::DbKeyPrefix::ClientSecret => {
-                    let secret = self
-                        .read_only
-                        .get_value(&ClientRange::ClientSecretKey)
-                        .await;
-                    if let Some(secret) = secret {
-                        client.insert("Client Secret".to_string(), Box::new(secret));
-                    }
-                }
-            }
-        }
-
-        self.serialized
-            .insert("Client".to_string(), Box::new(client));
+    async fn write_serialized_client_operation_log(
+        serialized: &mut BTreeMap<String, Box<dyn Serialize>>,
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) {
+        push_db_pair_items!(
+            dbtx,
+            OperationLogKeyPrefix,
+            OperationLogKey,
+            OperationLogEntry,
+            serialized,
+            "Operations"
+        );
     }
 }

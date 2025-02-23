@@ -1,33 +1,52 @@
 [package]
 name = "fedimint-dbtool"
-version = "0.1.0"
-edition = "2021"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+readme = { workspace = true }
+description = "Tool to inspect Fedimint client and server databases"
+repository = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
 
 [[bin]]
 path = "src/main.rs"
-name = "dbtool"
+name = "fedimint-dbtool"
+
+[lib]
+name = "fedimint_dbtool"
+path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.68"
-fedimint-aead = { path = "../crypto/aead" }
-bitcoin_hashes = "0.11.0"
-bytes = "1.4.0"
-clap = { version = "4.1.6", features  = [ "derive", "env" ] }
-fedimint-core ={ path = "../fedimint-core" }
-fedimint-server = { path = "../fedimint-server" }
-fedimint-rocksdb = { path = "../fedimint-rocksdb" }
-fedimint-mint-server = { path = "../modules/fedimint-mint-server" }
-fedimint-ln-server = { path = "../modules/fedimint-ln-server" }
-fedimint-logging = { path = "../fedimint-logging" }
-fedimint-wallet-server = { path = "../modules/fedimint-wallet-server" }
-futures = "0.3.24"
-erased-serde = "0.3"
-hex = { version = "0.4.3", features = [ "serde"] }
-fedimint-client-legacy = { path = "../fedimint-client-legacy" }
-serde = { version = "1.0.149", features = ["derive"] }
-serde_json = "1.0.91"
-strum = "0.24"
-strum_macros = "0.24"
-tokio = "1.26.0"
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+erased-serde = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-gateway-server = { workspace = true }
+fedimint-ln-client = { workspace = true }
+fedimint-ln-server = { workspace = true }
+fedimint-lnv2-client = { workspace = true }
+fedimint-lnv2-server = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-meta-client = { workspace = true }
+fedimint-meta-server = { workspace = true }
+fedimint-mint-client = { workspace = true }
+fedimint-mint-server = { workspace = true }
+fedimint-rocksdb = { workspace = true }
+fedimint-server = { workspace = true }
+fedimint-wallet-client = { workspace = true }
+fedimint-wallet-server = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+fedimint-build = { workspace = true }

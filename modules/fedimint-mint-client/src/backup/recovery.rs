@@ -1,47 +1,271 @@
-use std::cmp::{self, max};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp::max;
+use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::Range;
 
-use fedimint_client::sm::{OperationId, State, StateTransition};
-use fedimint_client::DynGlobalClientContext;
-use fedimint_core::core::LEGACY_HARDCODED_INSTANCE_ID_MINT;
-use fedimint_core::epoch::{ConsensusItem, SignedEpochOutcome};
-use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::{Amount, NumPeers, PeerId, TransactionId};
-use fedimint_derive_secret::DerivableSecret;
-use fedimint_logging::LOG_CLIENT_RECOVERY_MINT;
-use fedimint_mint_common::{MintConsensusItem, MintInput, MintOutput, Nonce};
-use futures::StreamExt;
-use tbs::{
-    combine_valid_shares, verify_blind_share, AggregatePublicKey, BlindedMessage, PublicKeyShare,
+use fedimint_client_module::module::init::ClientModuleRecoverArgs;
+use fedimint_client_module::module::init::recovery::{
+    RecoveryFromHistory, RecoveryFromHistoryCommon,
 };
+use fedimint_client_module::module::{ClientContext, OutPointRange};
+use fedimint_core::core::OperationId;
+use fedimint_core::db::{DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _};
+use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::{
+    Amount, NumPeersExt, OutPoint, PeerId, Tiered, TieredMulti, apply, async_trait_maybe_send,
+};
+use fedimint_derive_secret::DerivableSecret;
+use fedimint_logging::{LOG_CLIENT_MODULE_MINT, LOG_CLIENT_RECOVERY, LOG_CLIENT_RECOVERY_MINT};
+use fedimint_mint_common::{MintInput, MintOutput, Nonce};
+use serde::{Deserialize, Serialize};
+use tbs::{AggregatePublicKey, BlindedMessage, PublicKeyShare};
 use threshold_crypto::G1Affine;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
-use super::*;
-use crate::db::{NextECashNoteIndexKey, NoteKey};
-use crate::output::{MintOutputCommon, MintOutputStatesCreated, NoteIssuanceRequest};
-use crate::MintClientContext;
+use super::EcashBackup;
+use crate::backup::EcashBackupV0;
+use crate::client_db::{
+    NextECashNoteIndexKey, NoteKey, RecoveryFinalizedKey, RecoveryStateKey, ReusedNoteIndices,
+};
+use crate::event::NoteCreated;
+use crate::output::{
+    MintOutputCommon, MintOutputStateMachine, MintOutputStatesCreated, NoteIssuanceRequest,
+};
+use crate::{MintClientInit, MintClientModule, MintClientStateMachines, NoteIndex, SpendableNote};
 
-/// Restore will progress in chunks of a fixed epoch count,
-/// after each the current state is persisted in the database.
-/// Larger chunks introduce less "pausing" processing and snapshoting
-/// storage and overhead  but risk loosing more progress each time the
-/// client app is closed. Some time based, or even "save on close"
-/// scheme would be better, but currently not implemented.
-const PROGRESS_SNAPSHOT_EPOCHS: u64 = 500;
+#[derive(Clone, Debug)]
+pub struct MintRecovery {
+    state: MintRecoveryStateV2,
+    secret: DerivableSecret,
+    client_ctx: ClientContext<MintClientModule>,
+}
 
-#[derive(Debug)]
+#[apply(async_trait_maybe_send!)]
+impl RecoveryFromHistory for MintRecovery {
+    type Init = MintClientInit;
+
+    async fn new(
+        _init: &Self::Init,
+        args: &ClientModuleRecoverArgs<Self::Init>,
+        snapshot: Option<&EcashBackup>,
+    ) -> anyhow::Result<(Self, u64)> {
+        let snapshot_v0 = match snapshot {
+            Some(EcashBackup::V0(snapshot_v0)) => Some(snapshot_v0),
+            Some(EcashBackup::Default { variant, .. }) => {
+                warn!(%variant, "Unsupported backup variant. Ignoring mint backup.");
+                None
+            }
+            None => None,
+        };
+
+        let config = args.cfg();
+
+        let secret = args.module_root_secret().clone();
+        let (snapshot, starting_session) = if let Some(snapshot) = snapshot_v0 {
+            (snapshot.clone(), snapshot.session_count)
+        } else {
+            (EcashBackupV0::new_empty(), 0)
+        };
+
+        Ok((
+            MintRecovery {
+                state: MintRecoveryStateV2::from_backup(
+                    snapshot,
+                    100,
+                    config.tbs_pks.clone(),
+                    config.peer_tbs_pks.clone(),
+                    &secret,
+                ),
+                secret,
+                client_ctx: args.context(),
+            },
+            starting_session,
+        ))
+    }
+
+    async fn load_dbtx(
+        _init: &Self::Init,
+        dbtx: &mut DatabaseTransaction<'_>,
+        args: &ClientModuleRecoverArgs<Self::Init>,
+    ) -> anyhow::Result<Option<(Self, RecoveryFromHistoryCommon)>> {
+        dbtx.ensure_isolated()
+            .expect("Must be in prefixed database");
+        Ok(dbtx
+            .get_value(&RecoveryStateKey)
+            .await
+            .and_then(|(state, common)| {
+                if let MintRecoveryState::V2(state) = state {
+                    Some((state, common))
+                } else {
+                    warn!(target: LOG_CLIENT_RECOVERY, "Found unknown version recovery state. Ignoring");
+                    None
+                }
+            })
+            .map(|(state, common)| {
+                (
+                    MintRecovery {
+                        state,
+                        secret: args.module_root_secret().clone(),
+                        client_ctx: args.context(),
+                    },
+                    common,
+                )
+            }))
+    }
+
+    async fn store_dbtx(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        common: &RecoveryFromHistoryCommon,
+    ) {
+        dbtx.ensure_isolated()
+            .expect("Must be in prefixed database");
+        dbtx.insert_entry(
+            &RecoveryStateKey,
+            &(MintRecoveryState::V2(self.state.clone()), common.clone()),
+        )
+        .await;
+    }
+
+    async fn delete_dbtx(&self, dbtx: &mut DatabaseTransaction<'_>) {
+        dbtx.remove_entry(&RecoveryStateKey).await;
+    }
+
+    async fn load_finalized(dbtx: &mut DatabaseTransaction<'_>) -> Option<bool> {
+        dbtx.get_value(&RecoveryFinalizedKey).await
+    }
+
+    async fn store_finalized(dbtx: &mut DatabaseTransaction<'_>, state: bool) {
+        dbtx.insert_entry(&RecoveryFinalizedKey, &state).await;
+    }
+
+    async fn handle_input(
+        &mut self,
+        _client_ctx: &ClientContext<MintClientModule>,
+        _idx: usize,
+        input: &MintInput,
+        _session_idx: u64,
+    ) -> anyhow::Result<()> {
+        self.state.handle_input(input);
+        Ok(())
+    }
+
+    async fn handle_output(
+        &mut self,
+        _client_ctx: &ClientContext<MintClientModule>,
+        out_point: OutPoint,
+        output: &MintOutput,
+        _session_idx: u64,
+    ) -> anyhow::Result<()> {
+        self.state.handle_output(out_point, output, &self.secret);
+        Ok(())
+    }
+
+    /// Handle session outcome, adjusting the current state
+    async fn finalize_dbtx(&self, dbtx: &mut DatabaseTransaction<'_>) -> anyhow::Result<()> {
+        let finalized = self.state.clone().finalize();
+
+        let restored_amount = finalized
+            .unconfirmed_notes
+            .iter()
+            .map(|entry| entry.1)
+            .sum::<Amount>()
+            + finalized.spendable_notes.total_amount();
+
+        info!(
+            amount = %restored_amount,
+            burned_total = %finalized.burned_total,
+            "Finalizing mint recovery"
+        );
+
+        dbtx.insert_new_entry(&ReusedNoteIndices, &finalized.reused_note_indices)
+            .await;
+        debug!(
+            target: LOG_CLIENT_RECOVERY_MINT,
+            len = finalized.spendable_notes.count_items(),
+            "Restoring spendable notes"
+        );
+        for (amount, note) in finalized.spendable_notes.into_iter_items() {
+            let key = NoteKey {
+                amount,
+                nonce: note.nonce(),
+            };
+            debug!(target: LOG_CLIENT_MODULE_MINT, %amount, %note, "Restoring note");
+            self.client_ctx
+                .log_event(
+                    dbtx,
+                    NoteCreated {
+                        nonce: note.nonce(),
+                    },
+                )
+                .await;
+            dbtx.insert_new_entry(&key, &note.to_undecoded()).await;
+        }
+
+        for (amount, note_idx) in finalized.next_note_idx.iter() {
+            debug!(
+                target: LOG_CLIENT_RECOVERY_MINT,
+                %amount,
+                %note_idx,
+                "Restoring NextECashNodeIndex"
+            );
+            dbtx.insert_entry(&NextECashNoteIndexKey(amount), &note_idx.as_u64())
+                .await;
+        }
+
+        debug!(
+            target: LOG_CLIENT_RECOVERY_MINT,
+            len = finalized.unconfirmed_notes.len(),
+            "Restoring unconfirmed notes state machines"
+        );
+
+        for (out_point, amount, issuance_request) in finalized.unconfirmed_notes {
+            self.client_ctx
+                .add_state_machines_dbtx(
+                    dbtx,
+                    self.client_ctx
+                        .map_dyn(vec![MintClientStateMachines::Output(
+                            MintOutputStateMachine {
+                                common: MintOutputCommon {
+                                    operation_id: OperationId::new_random(),
+                                    out_point_range: OutPointRange::new_single(
+                                        out_point.txid,
+                                        out_point.out_idx,
+                                    )
+                                    .expect("Can't overflow"),
+                                },
+                                state: crate::output::MintOutputStates::Created(
+                                    MintOutputStatesCreated {
+                                        amount,
+                                        issuance_request,
+                                    },
+                                ),
+                            },
+                        )])
+                        .collect(),
+                )
+                .await?;
+        }
+
+        debug!(
+            target: LOG_CLIENT_RECOVERY_MINT,
+            "Mint module recovery finalized"
+        );
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EcashRecoveryFinalState {
-    /// Nonces that we track that are currently spendable.
-    spendable_notes: Vec<(Amount, SpendableNote)>,
-
+    pub spendable_notes: TieredMulti<SpendableNote>,
     /// Unsigned notes
-    unconfirmed_notes: Vec<(OutPoint, MultiNoteIssuanceRequest)>,
-
+    pub unconfirmed_notes: Vec<(OutPoint, Amount, NoteIssuanceRequest)>,
     /// Note index to derive next note in a given amount tier
-    next_note_idx: Tiered<NoteIndex>,
+    pub next_note_idx: Tiered<NoteIndex>,
+    /// Total burned amount
+    pub burned_total: Amount,
+    /// Note indices that were reused.
+    pub reused_note_indices: Vec<(Amount, NoteIndex)>,
 }
 
 /// Newtype over [`BlindedMessage`] to enable `Ord`
@@ -65,6 +289,15 @@ impl From<CompressedBlindedMessage> for BlindedMessage {
     }
 }
 
+#[derive(Debug, Clone, Decodable, Encodable)]
+pub enum MintRecoveryState {
+    #[encodable(index = 2)]
+    V2(MintRecoveryStateV2),
+    // index 0 has incompatible db encoding, index 1 was skipped to match with V2
+    #[encodable_default]
+    Default { variant: u64, bytes: Vec<u8> },
+}
+
 /// The state machine used for fast-forwarding backup from point when it was
 /// taken to the present time by following epoch history items from the time the
 /// snapshot was taken.
@@ -73,34 +306,10 @@ impl From<CompressedBlindedMessage> for BlindedMessage {
 /// valid consensus items from the epoch history between time taken (or even
 /// somewhat before it) and present time.
 #[derive(Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
-pub(crate) struct MintRestoreInProgressState {
-    start_epoch: u64,
-    next_epoch: u64,
-    end_epoch: u64,
-
+pub struct MintRecoveryStateV2 {
+    spendable_notes: BTreeMap<Nonce, (Amount, SpendableNote)>,
     /// Nonces that we track that are currently spendable.
-    spendable_note_by_nonce: BTreeMap<Nonce, (Amount, SpendableNote)>,
-
-    /// Outputs (by `OutPoint`) we track federation member confirmations for
-    /// blind nonces.
-    ///
-    /// Once we get enough confirmation (valid shares), these become new
-    /// spendable notes.
-    ///
-    /// Note that `NoteIssuanceRequest` is optional, as sometimes we might need
-    /// to handle a tx where only some of the blind nonces were in the pool.
-    /// A `None` means that this blind nonce/message is there only for
-    /// validation purposes, and will actually not create a
-    /// `spendable_note_by_nonce`
-    #[allow(clippy::type_complexity)]
-    pending_outputs: BTreeMap<
-        OutPoint,
-        (
-            TieredMulti<(CompressedBlindedMessage, Option<NoteIssuanceRequest>)>,
-            BTreeMap<PeerId, Vec<tbs::BlindedSignatureShare>>,
-        ),
-    >,
-
+    pending_outputs: BTreeMap<Nonce, (OutPoint, Amount, NoteIssuanceRequest)>,
     /// Next nonces that we expect might soon get used.
     /// Once we see them, we move the tracking to `pending_outputs`
     ///
@@ -108,237 +317,50 @@ pub(crate) struct MintRestoreInProgressState {
     /// the pool is kept shared (so only one lookup is enough), and
     /// replenishment is done each time a note is consumed.
     pending_nonces: BTreeMap<CompressedBlindedMessage, (NoteIssuanceRequest, NoteIndex, Amount)>,
-
+    /// Nonces that we have already used. Used for detecting double-used nonces
+    /// (accidentally burning funds).
+    used_nonces: BTreeMap<CompressedBlindedMessage, (NoteIssuanceRequest, NoteIndex, Amount)>,
+    /// Note indices that were reused.
+    reused_note_indices: Vec<(Amount, NoteIndex)>,
+    /// Total amount probably burned due to re-using nonces
+    burned_total: Amount,
     /// Tail of `pending`. `pending_notes` is filled by generating note with
     /// this index and incrementing it.
     next_pending_note_idx: Tiered<NoteIndex>,
-
     /// `LastECashNoteIndex` but tracked in flight. Basically max index of any
     /// note that got a partial sig from the federation (initialled from the
     /// backup value). TODO: One could imagine a case where the note was
     /// issued but not get any partial sigs yet. Very unlikely in real life
     /// scenario, but worth considering.
-    last_mined_nonce_idx: Tiered<NoteIndex>,
-
+    last_used_nonce_idx: Tiered<NoteIndex>,
     /// Threshold
     threshold: u64,
-
     /// Public key shares for each peer
     ///
     /// Used to validate contributed consensus items
     pub_key_shares: BTreeMap<PeerId, Tiered<PublicKeyShare>>,
-
     /// Aggregate public key for each amount tier
     tbs_pks: Tiered<AggregatePublicKey>,
-
     /// The number of nonces we look-ahead when looking for mints (per each
     /// amount).
     gap_limit: u64,
 }
 
-impl fmt::Debug for MintRestoreInProgressState {
+impl fmt::Debug for MintRecoveryStateV2 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!(
-            "MintRestoreInProgressState(start: {}, next: {}, end: {}, spendable_notes_by_nonce: {}, pending_outputs: {}, pending_nonces: {})",
-            self.start_epoch,
-            self.next_epoch,
-            self.end_epoch,
-            self.spendable_note_by_nonce.len(),
+            "MintRestoreInProgressState(pending_outputs: {}, pending_nonces: {}, used_nonces: {}, burned_total: {})",
             self.pending_outputs.len(),
-            self.pending_nonces.len()
+            self.pending_nonces.len(),
+            self.used_nonces.len(),
+            self.burned_total,
         ))
     }
 }
 
-impl MintRestoreInProgressState {
-    fn transitions(
-        &self,
-        operation_id: OperationId,
-        context: &MintClientContext,
-        global_context: &DynGlobalClientContext,
-    ) -> Vec<StateTransition<MintRestoreStateMachine>> {
-        let global_context = global_context.clone();
-        let global_context_2 = global_context.clone();
-        let secret = context.secret.clone();
-        let self_clone = self.clone();
-        vec![StateTransition::new(
-            async move {
-                self_clone
-                    .make_progress(
-                        global_context.api().clone(),
-                        global_context.decoders().clone(),
-                        global_context.client_config().epoch_pk,
-                        secret,
-                    )
-                    .await
-                    .consensus_encode_to_hex()
-                    .expect("Serialization here can't fail")
-            },
-            move |dbtx, new_state_hex, old_state_machine: MintRestoreStateMachine| {
-                let new_state = MintRestoreInProgressState::consensus_decode_hex(
-                    &new_state_hex,
-                    &Default::default(),
-                )
-                .expect("Deserialization here can't fail");
-                let global_context = global_context_2.clone();
-                Box::pin(async move {
-                    if new_state.is_done() {
-                        debug!(target: LOG_CLIENT_RECOVERY_MINT, "Finalizing restore");
-                        let finalized = new_state.finalize();
-
-                        {
-                            let mut dbtx = dbtx.module_tx();
-
-                            debug!(
-                                target: LOG_CLIENT_RECOVERY_MINT,
-                                len = finalized.spendable_notes.len(),
-                                "Restoring spendable notes"
-                            );
-                            for (amount, note) in finalized.spendable_notes {
-                                let key = NoteKey {
-                                    amount,
-                                    nonce: note.note.0,
-                                };
-                                dbtx.insert_new_entry(&key, &note).await;
-                            }
-                            for (amount, note_idx) in finalized.next_note_idx.iter() {
-                                debug!(
-                                    target: LOG_CLIENT_RECOVERY_MINT,
-                                    %amount,
-                                    %note_idx,
-                                    "Restoring NextECashNodeIndex"
-                                );
-                                dbtx.insert_entry(
-                                    &NextECashNoteIndexKey(amount),
-                                    &note_idx.as_u64(),
-                                )
-                                .await;
-                            }
-                        }
-
-                        debug!(
-                            target: LOG_CLIENT_RECOVERY_MINT,
-                            len = finalized.unconfirmed_notes.len(),
-                            "Restoring unconfigured notes state machines"
-                        );
-
-                        for (out_point, note_issuance) in finalized.unconfirmed_notes {
-                            global_context
-                                .add_state_machine(
-                                    dbtx,
-                                    MintClientStateMachines::Output(MintOutputStateMachine {
-                                        common: MintOutputCommon {
-                                            operation_id,
-                                            out_point,
-                                        },
-                                        state: crate::output::MintOutputStates::Created(
-                                            MintOutputStatesCreated { note_issuance },
-                                        ),
-                                    }),
-                                )
-                                .await
-                                .expect("Adding state machine can't fail")
-                        }
-
-                        MintRestoreStateMachine {
-                            operation_id: old_state_machine.operation_id,
-                            state: MintRestoreStates::Success,
-                        }
-                    } else {
-                        debug!(
-                            target: LOG_CLIENT_RECOVERY_MINT,
-                            "Saving restore progress checkpoint"
-                        );
-                        MintRestoreStateMachine {
-                            operation_id: old_state_machine.operation_id,
-                            state: MintRestoreStates::InProgress(new_state),
-                        }
-                    }
-                })
-            },
-        )]
-    }
-
-    async fn make_progress<'a>(
-        mut self,
-        api: DynGlobalApi,
-        decoders: ModuleDecoderRegistry,
-        epoch_pk: threshold_crypto::PublicKey,
-        secret: DerivableSecret,
-    ) -> Self {
-        assert_eq!(secret.level(), 2);
-        let epoch_range = self.next_epoch
-            ..cmp::min(
-                self.next_epoch.wrapping_add(PROGRESS_SNAPSHOT_EPOCHS),
-                self.end_epoch,
-            );
-        debug!(
-            target: LOG_CLIENT_RECOVERY_MINT,
-            ?epoch_range,
-            "Processing epochs"
-        );
-        let mut epoch_stream = Self::fetch_epochs_stream(api, epoch_pk, decoders, epoch_range);
-        while let Some((epoch, epoch_history)) = epoch_stream.next().await {
-            assert_eq!(epoch_history.outcome.epoch, epoch);
-            self.next_epoch = epoch + 1;
-
-            info!(target: LOG_CLIENT_RECOVERY_MINT, epoch, "Processing epoch");
-            let mut processed_txs = Default::default();
-            for (peer_id, items) in &epoch_history.outcome.items {
-                for item in items {
-                    self.handle_consensus_item(
-                        *peer_id,
-                        item,
-                        &mut processed_txs,
-                        &epoch_history.outcome.rejected_txs,
-                        &secret,
-                    );
-                }
-            }
-        }
-        self
-    }
-
-    /// Fetch epochs in a given range and send them over `sender`
-    ///
-    /// Since WASM's `spawn` does not support join handles, we indicate
-    /// errors via `sender` itself.
-    ///
-    /// TODO: could be internal to recovery_loop?
-    fn fetch_epochs_stream<'a>(
-        api: DynGlobalApi,
-        epoch_pk: threshold_crypto::PublicKey,
-        decoders: ModuleDecoderRegistry,
-        epoch_range: Range<u64>,
-    ) -> impl futures::Stream<Item = (u64, SignedEpochOutcome)> + 'a {
-        futures::stream::iter(epoch_range)
-            .map(move |epoch| {
-                let api = api.clone();
-                let decoders = decoders.clone();
-                Box::pin(async move {
-                    info!(epoch, "Fetching epoch");
-                    (
-                        epoch,
-                        loop {
-                            info!(target: LOG_CLIENT_RECOVERY_MINT, epoch, "Awaiting epoch");
-                            match api.fetch_epoch_history(epoch, epoch_pk, &decoders).await {
-                                Ok(o) => break o,
-                                Err(e) => {
-                                    info!(e = %e, epoch, "Error trying to fetch epoch history");
-                                }
-                            }
-                        },
-                    )
-                })
-            })
-            .buffered(8)
-    }
-}
-
-impl MintRestoreInProgressState {
+impl MintRecoveryStateV2 {
     pub fn from_backup(
-        current_epoch_count: u64,
-        backup: EcashBackup,
+        backup: EcashBackupV0,
         gap_limit: u64,
         tbs_pks: Tiered<AggregatePublicKey>,
         pub_key_shares: BTreeMap<PeerId, Tiered<PublicKeyShare>>,
@@ -346,40 +368,32 @@ impl MintRestoreInProgressState {
     ) -> Self {
         let amount_tiers: Vec<_> = tbs_pks.tiers().copied().collect();
         let mut s = Self {
-            start_epoch: backup.epoch_count,
-            next_epoch: backup.epoch_count,
-            end_epoch: current_epoch_count,
-            spendable_note_by_nonce: backup
-                .notes
-                .into_iter()
-                .map(|(amount, note)| (note.note.0, (amount, note)))
+            spendable_notes: backup
+                .spendable_notes
+                .into_iter_items()
+                .map(|(amount, note)| (note.nonce(), (amount, note)))
                 .collect(),
             pending_outputs: backup
                 .pending_notes
                 .into_iter()
-                .map(|(out_point, issuance_requests)| {
+                .map(|(outpoint, amount, issuance_request)| {
                     (
-                        out_point,
-                        (
-                            issuance_requests
-                                .notes
-                                .iter_items()
-                                .map(|(amount, iss_req)| {
-                                    (
-                                        amount,
-                                        (iss_req.recover_blind_nonce().0.into(), Some(*iss_req)),
-                                    )
-                                })
-                                .collect(),
-                            BTreeMap::default(),
-                        ),
+                        issuance_request.nonce(),
+                        (outpoint, amount, issuance_request),
                     )
                 })
                 .collect(),
+            reused_note_indices: Vec::new(),
             pending_nonces: BTreeMap::default(),
+            used_nonces: BTreeMap::default(),
+            burned_total: Amount::ZERO,
             next_pending_note_idx: backup.next_note_idx.clone(),
-            last_mined_nonce_idx: backup.next_note_idx,
-            threshold: pub_key_shares.threshold() as u64,
+            last_used_nonce_idx: backup
+                .next_note_idx
+                .into_iter()
+                .filter_map(|(a, idx)| idx.prev().map(|idx| (a, idx)))
+                .collect(),
+            threshold: pub_key_shares.to_num_peers().threshold() as u64,
             gap_limit,
             tbs_pks,
             pub_key_shares,
@@ -394,7 +408,7 @@ impl MintRestoreInProgressState {
 
     /// Fill each tier pool to the gap limit
     fn fill_initial_pending_nonces(&mut self, amount: Amount, secret: &DerivableSecret) {
-        info!(%amount, count=self.gap_limit, "Generating initial set of nonces for amount tier");
+        debug!(%amount, count=self.gap_limit, "Generating initial set of nonces for amount tier");
         for _ in 0..self.gap_limit {
             self.add_next_pending_nonce_in_pending_pool(amount, secret);
         }
@@ -405,24 +419,31 @@ impl MintRestoreInProgressState {
         let note_idx_ref = self.next_pending_note_idx.get_mut_or_default(amount);
 
         let (note_issuance_request, blind_nonce) = NoteIssuanceRequest::new(
-            secp256k1::SECP256K1,
-            MintClientModule::new_note_secret_static(secret, amount, *note_idx_ref),
+            fedimint_core::secp256k1::SECP256K1,
+            &MintClientModule::new_note_secret_static(secret, amount, *note_idx_ref),
         );
-        assert!(self
-            .pending_nonces
-            .insert(
-                blind_nonce.0.into(),
-                (note_issuance_request, *note_idx_ref, amount)
-            )
-            .is_none());
+        assert!(
+            self.pending_nonces
+                .insert(
+                    blind_nonce.0.into(),
+                    (note_issuance_request, *note_idx_ref, amount)
+                )
+                .is_none()
+        );
 
         note_idx_ref.advance();
     }
 
     pub fn handle_input(&mut self, input: &MintInput) {
-        // We attempt to delete any nonce we see as spent, simple
-        for (_amt, note) in input.0.iter_items() {
-            self.spendable_note_by_nonce.remove(&note.0);
+        match input {
+            MintInput::V0(input) => {
+                // We attempt to delete any nonce we see as spent, simple
+                self.pending_outputs.remove(&input.note.nonce);
+                self.spendable_notes.remove(&input.note.nonce);
+            }
+            MintInput::Default { variant, .. } => {
+                trace!("Ignoring future mint input variant {variant}");
+            }
         }
     }
 
@@ -432,105 +453,75 @@ impl MintRestoreInProgressState {
         output: &MintOutput,
         secret: &DerivableSecret,
     ) {
-        // There is nothing preventing other users from creating valid transactions
-        // mining notes to our own blind nonce, possibly even racing with us.
-        // Including amount in blind nonce derivation helps us avoid accidentally using
-        // a nonce mined for as smaller amount, but it doesn't eliminate completely
-        // the possibility that we might use a note mined in a different transaction,
-        // that our original one.
-        // While it is harmless to us, as such duplicated blind nonces are effective as
-        // good the as the original ones (same amount), it breaks the assumption
-        // that all our blind nonces in an our output need to be in the pending
-        // pool. It forces us to be greedy no matter what and take what we can,
-        // and just report anything suspicious.
-        //
-        // found - all nonces that we found in the pool with the correct amount
-        // missing - all the nonces we have not found in the pool, either because they
-        // are not ours           or were consumed by a previous transaction
-        // using this nonce, or possibly gap           buffer was too small
-        // wrong - nonces that were ours but were mined to a wrong
-        let (found, missing, wrong) = output.0.iter_items().fold(
-            (vec![], vec![], vec![]),
-            |(mut found, mut missing, mut wrong), (amount_from_output, nonce)| {
-                match self.pending_nonces.get(&nonce.0.into()).cloned() {
-                    Some((issuance_request, note_idx, pending_amount)) => {
-                        // the moment we see our blind nonce in the epoch history, correctly or
-                        // incorrectly used, we know that we must have used
-                        // already
-                        self.observe_nonce_idx_being_used(pending_amount, note_idx, secret);
+        let output = match output {
+            MintOutput::V0(output) => output,
+            MintOutput::Default { variant, .. } => {
+                trace!("Ignoring future mint output variant {variant}");
+                return;
+            }
+        };
 
-                        if pending_amount == amount_from_output {
-                            found.push((
-                                amount_from_output,
-                                (
-                                    CompressedBlindedMessage::from(nonce.0),
-                                    Some(issuance_request),
-                                ),
-                            ));
-                            (found, missing, wrong)
-                        } else {
-                            // put it back, incorrect amount
-                            self.pending_nonces.insert(
-                                nonce.0.into(),
-                                (issuance_request, note_idx, pending_amount),
-                            );
-                            // report problem
-                            wrong.push((
-                                out_point,
-                                nonce.0,
-                                pending_amount,
-                                amount_from_output,
-                                note_idx,
-                            ));
-                            (found, missing, wrong)
-                        }
-                    }
-                    None => {
-                        missing.push((amount_from_output, (nonce.0.into(), None)));
-                        (found, missing, wrong)
-                    }
-                }
-            },
-        );
-
-        for wrong in &wrong {
-            warn!(output = ?out_point,
-                 blind_nonce = ?wrong.1,
-                 expected_amount = %wrong.2,
-                 found_amount = %wrong.3,
-                 "Transaction output contains blind nonce that looks like ours but is of the wrong amount. Ignoring.");
-            // Any blind nonce mined with a wrong amount means that this
-            // transaction can't be ours
+        if let Some((_issuance_request, note_idx, amount)) =
+            self.used_nonces.get(&output.blind_nonce.0.into())
+        {
+            self.burned_total += *amount;
+            self.reused_note_indices.push((*amount, *note_idx));
+            warn!(
+                target: LOG_CLIENT_RECOVERY_MINT,
+                %note_idx,
+                %amount,
+                burned_total = %self.burned_total,
+                "Detected reused nonce during recovery. This means client probably burned funds in the past."
+            );
         }
+        // There is nothing preventing other users from creating valid
+        // transactions mining notes to our own blind nonce, possibly
+        // even racing with us. Including amount in blind nonce
+        // derivation helps us avoid accidentally using a nonce mined
+        // for as smaller amount, but it doesn't eliminate completely
+        // the possibility that we might use a note mined in a different
+        // transaction, that our original one.
+        // While it is harmless to us, as such duplicated blind nonces are
+        // effective as good the as the original ones (same amount), it
+        // breaks the assumption that all our blind nonces in an our
+        // output need to be in the pending pool. It forces us to be
+        // greedy no matter what and take what we can, and just report
+        // anything suspicious.
 
-        if !wrong.is_empty() {
-            return;
+        if let Some((issuance_request, note_idx, pending_amount)) =
+            self.pending_nonces.remove(&output.blind_nonce.0.into())
+        {
+            // the moment we see our blind nonce in the epoch history, correctly or
+            // incorrectly used, we know that we must have used
+            // already
+            self.observe_nonce_idx_being_used(pending_amount, note_idx, secret);
+
+            if pending_amount == output.amount {
+                self.used_nonces.insert(
+                    output.blind_nonce.0.into(),
+                    (issuance_request, note_idx, pending_amount),
+                );
+
+                self.pending_outputs.insert(
+                    issuance_request.nonce(),
+                    (out_point, output.amount, issuance_request),
+                );
+            } else {
+                // put it back, incorrect amount
+                self.pending_nonces.insert(
+                    output.blind_nonce.0.into(),
+                    (issuance_request, note_idx, pending_amount),
+                );
+                warn!(
+                    target: LOG_CLIENT_RECOVERY_MINT,
+                    output = ?out_point,
+                    blind_nonce = ?output.blind_nonce.0,
+                    expected_amount = %pending_amount,
+                    found_amount = %output.amount,
+                    "Transaction output contains blind nonce that looks like ours but is of the wrong amount. Ignoring."
+                );
+            }
         }
-
-        if found.is_empty() {
-            // If we found nothing, this is not our output
-            return;
-        }
-
-        for &(_amount, (ref nonce, _)) in &missing {
-            warn!(output = ?out_point,
-                 nonce = ?nonce,
-                 "Missing nonce in pending pool for a transaction with other valid nonces that belong to us. This indicate an issue.");
-        }
-
-        // ok, now that we know we track this output as ours and use the nonces we've
-        // found delete them from the pool and replace them
-        for &(_amount, (ref nonce, _)) in &found {
-            assert!(self.pending_nonces.remove(&nonce.clone()).is_some());
-        }
-
-        self.pending_outputs.insert(
-            out_point,
-            (
-                TieredMulti::from_iter(found.into_iter().chain(missing.into_iter())),
-                BTreeMap::new(),
-            ),
-        );
     }
 
     /// React to a valid pending nonce being tracked being used in the epoch
@@ -545,18 +536,21 @@ impl MintRestoreInProgressState {
         note_idx: NoteIndex,
         secret: &DerivableSecret,
     ) {
-        *self.last_mined_nonce_idx.entry(amount).or_default() = max(
-            self.last_mined_nonce_idx
-                .get(amount)
-                .copied()
-                .unwrap_or_default(),
-            note_idx,
+        self.last_used_nonce_idx.insert(
+            amount,
+            max(
+                self.last_used_nonce_idx
+                    .get(amount)
+                    .copied()
+                    .unwrap_or_default(),
+                note_idx,
+            ),
         );
 
         while self.next_pending_note_idx.get_mut_or_default(amount).0
             < self.gap_limit
                 + self
-                    .last_mined_nonce_idx
+                    .last_used_nonce_idx
                     .get(amount)
                     .expect("must be there already")
                     .0
@@ -565,289 +559,18 @@ impl MintRestoreInProgressState {
         }
     }
 
-    pub fn handle_output_confirmation(&mut self, peer_id: PeerId, sigs: &MintConsensusItem) {
-        let enough_shares = if let Some((output_data, peer_shares)) =
-            self.pending_outputs.get_mut(&sigs.out_point)
-        {
-            if !sigs.signatures.0.structural_eq(output_data) {
-                warn!(
-                    peer = %peer_id,
-                    "Peer proposed a sig share of wrong structure (different than out_point)",
-                );
-                return;
-            }
-
-            for ((share_amt, share_sig), (output_item_amt, output_data_item)) in
-                sigs.signatures.0.iter_items().zip(output_data.iter_items())
-            {
-                // Guaranteed by the structural_eq check above
-                assert_eq!(share_amt, output_item_amt);
-
-                let amount_key = match self.pub_key_shares[&peer_id].tier(&share_amt) {
-                    Ok(key) => key,
-                    Err(_) => {
-                        error!(
-                            ?peer_id,
-                            amount = ?share_amt,
-                            "Missing public key for the amount. This should not happen."
-                        );
-                        return;
-                    }
-                };
-
-                if !verify_blind_share(output_data_item.0.clone().into(), share_sig.1, *amount_key)
-                {
-                    warn!(?peer_id, "Ignoring invalid contribution share from peer");
-                    return;
-                }
-            }
-
-            if let Some(_prev) = peer_shares.insert(
-                peer_id,
-                // We compact the shares to a `Vec<BlindedSignatureShare>` like
-                // we eventually want in the consensus itself: https://github.com/fedimint/fedimint/issues/1053#issue-1477111966
-                sigs.signatures
-                    .0
-                    .iter_items()
-                    .map(|(_, (_, sig_share))| *sig_share)
-                    .collect(),
-            ) {
-                warn!(
-                    out_point = %sigs.out_point,
-                    ?peer_id,
-                    "Duplicate signature share for out_point",
-                );
-            }
-
-            self.threshold <= peer_shares.len() as u64
-        } else {
-            false
-        };
-
-        if enough_shares {
-            let (output_data, sig_shares) = self
-                .pending_outputs
-                .remove(&sigs.out_point)
-                .expect("must be in the map already");
-
-            for (item_i, (item_amt, item)) in output_data.iter_items().enumerate() {
-                let iss_request = if let Some(iss_request) = item.1 {
-                    iss_request
-                } else {
-                    // Items without issuance request are ones we don't consider ours
-                    // for some reason, so there's no point combining sigs for them.
-                    continue;
-                };
-
-                let sig = combine_valid_shares(
-                    sig_shares
-                        .iter()
-                        .map(|(peer, shares)| (peer.to_usize(), shares[item_i])),
-                    self.threshold as usize,
-                );
-
-                let note = iss_request
-                    .finalize(
-                        sig,
-                        *self
-                            .tbs_pks
-                            .tier(&item_amt)
-                            .expect("must have keys for all amounts here"),
-                    )
-                    .expect("We can assume all data valid at this point");
-
-                self.spendable_note_by_nonce
-                    .insert(iss_request.nonce(), (item_amt, note));
-            }
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.next_epoch == self.end_epoch
-    }
-
-    pub(crate) fn handle_consensus_item(
-        &mut self,
-        peer_id: PeerId,
-        item: &ConsensusItem,
-        processed_txs: &mut HashSet<TransactionId>,
-        rejected_txs: &BTreeSet<TransactionId>,
-        secret: &DerivableSecret,
-    ) {
-        trace!(
-            target: LOG_CLIENT_RECOVERY_MINT,
-            ?item,
-            "handling consensus item"
-        );
-        // assert_eq!(epoch, self.next_epoch);
-        match item {
-            ConsensusItem::Transaction(tx) => {
-                let txid = tx.tx_hash();
-
-                debug!(
-                    target: LOG_CLIENT_RECOVERY_MINT,
-                    tx_hash = %tx.tx_hash(),
-                    "handling transaction"
-                );
-
-                if !processed_txs.insert(txid) {
-                    // Just like server side consensus, do not attempt to process the same
-                    // transaction twice.
-                    debug!(
-                        target: LOG_CLIENT_RECOVERY_MINT,
-                        tx_hash = %tx.tx_hash(),
-                        "transaction was already processed"
-                    );
-                    return;
-                }
-
-                if rejected_txs.contains(&txid) {
-                    debug!(
-                        target: LOG_CLIENT_RECOVERY_MINT,
-                        tx_hash = %tx.tx_hash(),
-                        "transaction was rejected"
-                    );
-                    // Do not process invalid transactions.
-                    // Consensus history contains all data proposed by each peer, even invalid (e.g.
-                    // due to double spent) transactions. Precisely to save
-                    // downstream users from having to run the consensus themselves,
-                    // each epoch contains a list of transactions  that turned out to be invalid.
-                    return;
-                }
-
-                for input in &tx.inputs {
-                    if input.module_instance_id() == LEGACY_HARDCODED_INSTANCE_ID_MINT {
-                        let input = input
-                            .as_any()
-                            .downcast_ref::<MintInput>()
-                            .expect("mint key just checked");
-
-                        self.handle_input(input);
-                    }
-                }
-
-                for (out_idx, output) in tx.outputs.iter().enumerate() {
-                    if output.module_instance_id() == LEGACY_HARDCODED_INSTANCE_ID_MINT {
-                        let output = output
-                            .as_any()
-                            .downcast_ref::<MintOutput>()
-                            .expect("mint key just checked");
-
-                        self.handle_output(
-                            OutPoint {
-                                txid,
-                                out_idx: out_idx as u64,
-                            },
-                            output,
-                            secret,
-                        );
-                    }
-                }
-            }
-            ConsensusItem::Module(module_item) => {
-                if module_item.module_instance_id() == LEGACY_HARDCODED_INSTANCE_ID_MINT {
-                    let mint_item = module_item
-                        .as_any()
-                        .downcast_ref::<MintConsensusItem>()
-                        .expect("mint key just checked");
-
-                    debug!(
-                        target: LOG_CLIENT_RECOVERY_MINT,
-                        out_point = %mint_item.out_point,
-                        "handlng mint consensus item"
-                    );
-                    self.handle_output_confirmation(peer_id, mint_item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn finalize(self) -> EcashRecoveryFinalState {
+    pub fn finalize(self) -> EcashRecoveryFinalState {
         EcashRecoveryFinalState {
-            spendable_notes: self
-                .spendable_note_by_nonce
-                .into_iter()
-                .map(|(_nonce, (amount, snote))| (amount, snote))
-                .collect(),
-            unconfirmed_notes: self
-                .pending_outputs
-                .into_iter()
-                .map(|(out_point, data)| {
-                    (
-                        out_point,
-                        MultiNoteIssuanceRequest {
-                            notes: TieredMulti::from_iter(data.0.into_iter_items().filter_map(
-                                |(amount, (_bn, opt_note_iss_req))| {
-                                    opt_note_iss_req.map(|iss_req| (amount, iss_req))
-                                },
-                            )),
-                        },
-                    )
-                })
-                .collect(),
+            spendable_notes: self.spendable_notes.into_values().collect(),
+            unconfirmed_notes: self.pending_outputs.into_values().collect(),
             // next note idx is the last one detected as used + 1
-            next_note_idx: Tiered::from_iter(
-                self.last_mined_nonce_idx
-                    .iter()
-                    .map(|(amount, value)| (amount, value.next())),
-            ),
+            next_note_idx: self
+                .last_used_nonce_idx
+                .iter()
+                .map(|(amount, value)| (amount, value.next()))
+                .collect(),
+            reused_note_indices: self.reused_note_indices,
+            burned_total: self.burned_total,
         }
     }
 }
-
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
-pub(crate) struct MintRestoreFailedState {
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
-pub struct MintRestoreStateMachine {
-    pub(crate) operation_id: OperationId,
-    pub(crate) state: MintRestoreStates,
-}
-
-impl State for MintRestoreStateMachine {
-    type ModuleContext = MintClientContext;
-    type GlobalContext = DynGlobalClientContext;
-
-    fn transitions(
-        &self,
-        context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
-    ) -> Vec<StateTransition<Self>> {
-        match &self.state {
-            MintRestoreStates::InProgress(state) => {
-                state.transitions(self.operation_id, context, global_context)
-            }
-            MintRestoreStates::Failed(_) => vec![],
-            MintRestoreStates::Success => vec![],
-        }
-    }
-
-    fn operation_id(&self) -> OperationId {
-        self.operation_id
-    }
-}
-
-#[aquamarine::aquamarine]
-/// State machine managing e-cash that has been taken out of the wallet for
-/// out-of-band transmission.
-///
-/// ```mermaid
-/// graph LR
-///     Created -- User triggered refund --> RefundU["User Refund"]
-///     Created -- Timeout triggered refund --> RefundT["Timeout Refund"]
-/// ```
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
-pub(crate) enum MintRestoreStates {
-    /// The restore has been started and is processing
-    InProgress(MintRestoreInProgressState),
-    /// Done
-    Success,
-    /// Something went wrong, and restore failed
-    Failed(MintRestoreFailedState),
-}
-
-#[cfg(test)]
-mod tests;

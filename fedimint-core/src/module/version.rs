@@ -5,9 +5,9 @@
 //! Fedimint federations are expected to last and serve over time diverse set of
 //! clients running on various devices and platforms with different
 //! versions of the client software. To ensure broad interoperability core
-//! Fedimint logic and modules use consensus and API versiong scheme.
+//! Fedimint logic and modules use consensus and API version scheme.
 //!
-//! ## Definions
+//! ## Definitions
 //!
 //! * Fedimint *component* - either a core Fedimint logic or one of the modules
 //!
@@ -20,7 +20,7 @@
 //! The set of all consensus versions of each component is a part of consensus
 //! config that is identical for all peers.
 //!
-//! The code implementing given component can however suport multiple consensus
+//! The code implementing given component can however support multiple consensus
 //! versions at the same time, making it possible to use the same code for
 //! diverse set of Federations created at different times. The consensus
 //! version to run with is passed to the code during initialization.
@@ -33,14 +33,14 @@
 //!
 //! ## API versions
 //!
-//! Unlike consensus version which has to be single and identical accross
-//! Federation, both server and client side components can advertise simultanous
-//! support for multiple API versions. This is the main mechanism to ensure
-//! interoperability in the face of hard to control and predict software changes
-//! accross all the involved software.
+//! Unlike consensus version which has to be single and identical across
+//! Federation, both server and client side components can advertise
+//! simultaneous support for multiple API versions. This is the main mechanism
+//! to ensure interoperability in the face of hard to control and predict
+//! software changes across all the involved software.
 //!
 //! Each peer in the Federation and each client can update the Fedimint software
-//! at their own pace without cordinating API changes.
+//! at their own pace without coordinating API changes.
 //!
 //! Each client is expected to survey Federation API support and discover the
 //! API version to use for each component.
@@ -54,11 +54,12 @@
 //!
 //! [`ApiVersion`] and [`MultiApiVersion`] is used for API versioning.
 use std::collections::BTreeMap;
-use std::result;
+use std::{cmp, result};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::ModuleInstanceId;
+use crate::core::{ModuleInstanceId, ModuleKind};
+use crate::db::DatabaseVersion;
 use crate::encoding::{Decodable, Encodable};
 
 /// Consensus version of a core server
@@ -67,32 +68,40 @@ use crate::encoding::{Decodable, Encodable};
 ///
 /// See [`ModuleConsensusVersion`] for more details on how it interacts with
 /// module's consensus.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, Encodable, Decodable, PartialEq, Eq)]
-pub struct CoreConsensusVersion(pub u32);
+#[derive(
+    Debug, Copy, Clone, PartialOrd, Ord, Serialize, Deserialize, Encodable, Decodable, PartialEq, Eq,
+)]
+pub struct CoreConsensusVersion {
+    pub major: u32,
+    pub minor: u32,
+}
 
-impl From<u32> for CoreConsensusVersion {
-    fn from(value: u32) -> Self {
-        Self(value)
+impl CoreConsensusVersion {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
     }
 }
 
+/// Globally declared core consensus version
+pub const CORE_CONSENSUS_VERSION: CoreConsensusVersion = CoreConsensusVersion::new(2, 1);
+
 /// Consensus version of a specific module instance
 ///
-/// Any breaking change to the module's consensus rules require incrementing it.
+/// Any breaking change to the module's consensus rules require incrementing the
+/// major part of it.
+///
+/// Any backwards-compatible changes with regards to clients require
+/// incrementing the minor part of it. Backwards compatible changes will
+/// typically be introducing new input/output/consensus item variants that old
+/// clients won't understand but can safely ignore while new clients can use new
+/// functionality. It's akin to soft forks in Bitcoin.
 ///
 /// A module instance can run only in one consensus version, which must be the
-/// same across all corresponding instances on other nodes of the federation.
+/// same (both major and minor) across all corresponding instances on other
+/// nodes of the federation.
 ///
 /// When [`CoreConsensusVersion`] changes, this can but is not requires to be
 /// a breaking change for each module's [`ModuleConsensusVersion`].
-///
-/// Incrementing the module's consensus version can be considered an in-place
-/// upgrade path, similar to a blockchain hard-fork consensus upgrade.
-///
-/// As of time of writing this comment there are no plans to support any kind
-/// of "soft-forks" which mean a consensus minor version. As the set of
-/// federation member's is closed and limited, it is always preferable to
-/// synchronize upgrade and avoid cross-version incompatibilities.
 ///
 /// For many modules it might be preferable to implement a new
 /// [`fedimint_core::core::ModuleKind`] "versions" (to be implemented at the
@@ -100,12 +109,28 @@ impl From<u32> for CoreConsensusVersion {
 /// the same time (each of different `ModuleKind` version), allow users to
 /// slowly migrate to a new one. This avoids complex and error-prone server-side
 /// consensus-migration logic.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Encodable, Decodable)]
-pub struct ModuleConsensusVersion(pub u32);
+#[derive(
+    Debug,
+    Hash,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    Encodable,
+    Decodable,
+)]
+pub struct ModuleConsensusVersion {
+    pub major: u32,
+    pub minor: u32,
+}
 
-impl From<u32> for ModuleConsensusVersion {
-    fn from(value: u32) -> Self {
-        Self(value)
+impl ModuleConsensusVersion {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
     }
 }
 
@@ -145,6 +170,32 @@ pub struct ApiVersion {
     pub minor: u32,
 }
 
+impl ApiVersion {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+}
+
+/// ```
+/// use fedimint_core::module::ApiVersion;
+/// assert!(ApiVersion { major: 3, minor: 3 } < ApiVersion { major: 4, minor: 0 });
+/// assert!(ApiVersion { major: 3, minor: 3 } < ApiVersion { major: 3, minor: 5 });
+/// assert!(ApiVersion { major: 3, minor: 3 } == ApiVersion { major: 3, minor: 3 });
+/// ```
+impl cmp::PartialOrd for ApiVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl cmp::Ord for ApiVersion {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.major
+            .cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+    }
+}
+
 /// Multiple, disjoint, minimum required or maximum supported, [`ApiVersion`]s.
 ///
 /// If a given component can (potentially) support multiple different (distinct
@@ -156,12 +207,12 @@ pub struct ApiVersion {
 /// Each element must have a distinct major api number, and means
 /// either minimum required API version of this major number (for the client),
 /// or maximum supported version of this major number (for the server).
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Default, Encodable, Decodable)]
 pub struct MultiApiVersion(Vec<ApiVersion>);
 
 impl MultiApiVersion {
     pub fn new() -> Self {
-        Default::default()
+        Self::default()
     }
 
     /// Verify the invariant: sorted by unique major numbers
@@ -171,7 +222,7 @@ impl MultiApiVersion {
             .fold((None, true), |(prev, is_sorted), next| {
                 (
                     Some(*next),
-                    is_sorted && prev.map(|prev| prev.major < next.major).unwrap_or(true),
+                    is_sorted && prev.is_none_or(|prev| prev.major < next.major),
                 )
             })
             .1
@@ -270,7 +321,7 @@ impl<'a> IntoIterator for &'a MultiApiVersion {
 impl FromIterator<ApiVersion> for Result<MultiApiVersion, ApiVersion> {
     fn from_iter<T: IntoIterator<Item = ApiVersion>>(iter: T) -> Self {
         let mut s = MultiApiVersion::new();
-        for version in iter.into_iter() {
+        for version in iter {
             if s.try_insert(version).is_err() {
                 return Err(version);
             }
@@ -316,27 +367,49 @@ fn api_version_multi_from_iter_sanity() {
         }])
         .is_ok()
     );
-    assert!(result::Result::<MultiApiVersion, ApiVersion>::from_iter([
-        ApiVersion { major: 0, minor: 1 },
-        ApiVersion { major: 1, minor: 2 }
-    ])
-    .is_ok());
-    assert!(result::Result::<MultiApiVersion, ApiVersion>::from_iter([
-        ApiVersion { major: 0, minor: 1 },
-        ApiVersion { major: 1, minor: 2 },
-        ApiVersion { major: 0, minor: 1 },
-    ])
-    .is_err());
+    assert!(
+        result::Result::<MultiApiVersion, ApiVersion>::from_iter([
+            ApiVersion { major: 0, minor: 1 },
+            ApiVersion { major: 1, minor: 2 }
+        ])
+        .is_ok()
+    );
+    assert!(
+        result::Result::<MultiApiVersion, ApiVersion>::from_iter([
+            ApiVersion { major: 0, minor: 1 },
+            ApiVersion { major: 1, minor: 2 },
+            ApiVersion { major: 0, minor: 1 },
+        ])
+        .is_err()
+    );
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct SupportedCoreApiVersions {
     pub core_consensus: CoreConsensusVersion,
     /// Supported Api versions for this core consensus versions
     pub api: MultiApiVersion,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl SupportedCoreApiVersions {
+    /// Get minor supported version by consensus and major numbers
+    pub fn get_minor_api_version(
+        &self,
+        core_consensus: CoreConsensusVersion,
+        major: u32,
+    ) -> Option<u32> {
+        if self.core_consensus.major != core_consensus.major {
+            return None;
+        }
+
+        self.api.get_by_major(major).map(|v| {
+            debug_assert_eq!(v.major, major);
+            v.minor
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct SupportedModuleApiVersions {
     pub core_consensus: CoreConsensusVersion,
     pub module_consensus: ModuleConsensusVersion,
@@ -349,25 +422,58 @@ impl SupportedModuleApiVersions {
     ///
     /// Panics if `api_version` parts conflict as per
     /// [`SupportedModuleApiVersions`] invariants.
-    pub fn from_raw(core: u32, module: u32, api_versions: &[(u32, u32)]) -> Self {
+    pub fn from_raw(core: (u32, u32), module: (u32, u32), api_versions: &[(u32, u32)]) -> Self {
         Self {
-            core_consensus: CoreConsensusVersion(core),
-            module_consensus: ModuleConsensusVersion(module),
-            api: result::Result::<MultiApiVersion, ApiVersion>::from_iter(
-                api_versions
-                    .iter()
-                    .copied()
-                    .map(|(major, minor)| ApiVersion { major, minor }),
-            )
+            core_consensus: CoreConsensusVersion::new(core.0, core.1),
+            module_consensus: ModuleConsensusVersion::new(module.0, module.1),
+            api: api_versions
+                .iter()
+                .copied()
+                .map(|(major, minor)| ApiVersion { major, minor })
+                .collect::<result::Result<MultiApiVersion, ApiVersion>>()
             .expect(
                 "overlapping (conflicting) api versions when declaring SupportedModuleApiVersions",
             ),
         }
     }
+
+    /// Get minor supported version by consensus and major numbers
+    pub fn get_minor_api_version(
+        &self,
+        core_consensus: CoreConsensusVersion,
+        module_consensus: ModuleConsensusVersion,
+        major: u32,
+    ) -> Option<u32> {
+        if self.core_consensus.major != core_consensus.major {
+            return None;
+        }
+
+        if self.module_consensus.major != module_consensus.major {
+            return None;
+        }
+
+        self.api.get_by_major(major).map(|v| {
+            debug_assert_eq!(v.major, major);
+            v.minor
+        })
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Decodable, Encodable)]
 pub struct SupportedApiVersionsSummary {
     pub core: SupportedCoreApiVersions,
     pub modules: BTreeMap<ModuleInstanceId, SupportedModuleApiVersions>,
+}
+
+/// A summary of server API versions for core and all registered modules.
+#[derive(Serialize)]
+pub struct ServerApiVersionsSummary {
+    pub core: MultiApiVersion,
+    pub modules: BTreeMap<ModuleKind, MultiApiVersion>,
+}
+
+/// A summary of server database versions for all registered modules.
+#[derive(Serialize)]
+pub struct ServerDbVersionsSummary {
+    pub modules: BTreeMap<ModuleKind, DatabaseVersion>,
 }

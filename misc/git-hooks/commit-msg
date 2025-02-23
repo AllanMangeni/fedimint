@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-
-set -eu
-
 # Sanitize file first, by removing leading lines that are empty or start with a hash,
 # as `convco` currently does not do it automatically (but git will)
 # TODO: next release of convco should be able to do it automatically
@@ -19,8 +16,8 @@ MESSAGE="$(
 
 # convco fails on fixup!, so remove fixup! prefix
 MESSAGE="${MESSAGE#fixup! }"
-if ! convco check <<<"$MESSAGE" ; then
+if ! convco check --from-stdin <<<"$MESSAGE" ; then
    >&2 echo "Please follow conventional commits(https://www.conventionalcommits.org)"
-   >&2 echo "Use git recommit <args> to fix your commit"
+   >&2 echo "Use git commit <args> to fix your commit"
   exit 1
 fi

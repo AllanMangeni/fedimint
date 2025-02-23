@@ -1,26 +1,36 @@
-use std::collections::HashMap;
+#![deny(clippy::pedantic)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::ref_option)]
+#![allow(clippy::too_many_lines)]
+
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use std::vec;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use common::{
-    cln_create_invoice, cln_wait_invoice_payment, gateway_pay_invoice, get_note_summary,
-    lnd_create_invoice, lnd_wait_invoice_payment, parse_ecash, reissue_notes,
+    cln_create_invoice, cln_pay_invoice, cln_wait_invoice_payment, gateway_pay_invoice,
+    get_note_summary, parse_gateway_id, reissue_notes,
 };
 use devimint::cmd;
-use fedimint_client::Client;
-use fedimint_core::api::{GlobalFederationApi, WsClientConnectInfo, WsFederationApi};
-use fedimint_core::config::{load_from_file, ClientConfig};
+use devimint::util::GatewayLndCli;
+use fedimint_client::ClientHandleArc;
+use fedimint_core::Amount;
+use fedimint_core::endpoint_constants::SESSION_COUNT_ENDPOINT;
+use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::ApiRequestErased;
-use fedimint_core::task::TaskGroup;
-use fedimint_core::util::BoxFuture;
-use fedimint_core::{Amount, TieredMulti};
-use fedimint_mint_client::SpendableNote;
-use lightning_invoice::Invoice;
+use fedimint_core::runtime::spawn;
+use fedimint_core::util::{BoxFuture, SafeUrl};
+use fedimint_ln_client::{LightningClientModule, LnReceiveState};
+use fedimint_ln_common::LightningGateway;
+use fedimint_mint_client::OOBNotes;
+use futures::StreamExt;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
@@ -28,8 +38,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::common::{
-    build_client, do_spend_notes, remint_denomination, switch_default_gateway, try_get_notes_cli,
-    FedimintCli, GatewayClnCli, GatewayLndCli,
+    build_client, do_spend_notes, get_invite_code_cli, remint_denomination, try_get_notes_cli,
 };
 pub mod common;
 
@@ -59,15 +68,14 @@ struct Opts {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LnInvoiceGeneration {
     ClnLightningCli,
-    LnCli,
 }
 
 #[derive(Subcommand, Clone)]
 enum Command {
     #[command(about = "Keep many websocket connections to a federation for a duration of time")]
     TestConnect {
-        #[clap(flatten)]
-        connect_common_args: ConnectCommonArgs,
+        #[arg(long, help = "Federation invite code")]
+        invite_code: String,
         #[arg(
             long,
             default_value = "60",
@@ -87,40 +95,41 @@ enum Command {
         limit_endpoints: Option<usize>,
     },
     #[command(about = "Try to download the client config many times.")]
-    TestDownload { connect: String },
+    TestDownload {
+        #[arg(long, help = "Federation invite code")]
+        invite_code: String,
+    },
     #[command(
         about = "Run a load test where many users in parallel will try to reissue notes and pay invoices through the gateway"
     )]
     LoadTest(LoadTestArgs),
-}
-#[derive(Args, Clone)]
-struct ConnectCommonArgs {
-    #[arg(
-        long,
-        help = "Path of the client config.json. If none given, will try to download it from the --connect info"
-    )]
-    client_config: Option<PathBuf>,
-
-    #[arg(
-        long,
-        help = "Connect info string. If none given, will use the one from fedimint-cli if no --client-config given"
-    )]
-    connect: Option<String>,
+    /// Run a load test where many users in parallel will receive then send a
+    /// payment through lightning.
+    /// It's 'circular' because the funds always come back to the same user then
+    /// we can keep making the payments in a loop
+    #[command()]
+    LnCircularLoadTest(LnCircularLoadTestArgs),
 }
 
 #[derive(Args, Clone)]
 struct LoadTestArgs {
-    #[clap(flatten)]
-    connect_common_args: ConnectCommonArgs,
-
-    #[arg(long, value_parser = parse_ecash, help = "Notes for the test. If none, will call fedimint-cli spend")]
-    initial_notes: Option<TieredMulti<SpendableNote>>,
+    #[arg(
+        long,
+        help = "Federation invite code. If none given, we assume the client already has a config downloaded in DB"
+    )]
+    invite_code: Option<InviteCode>,
 
     #[arg(
         long,
-        help = "Gateway public key. If none, retrieve one according to --generate-invoice-with"
+        help = "Notes for the test. If none and no funds on archive, will call fedimint-cli spend"
     )]
-    gateway_public_key: Option<String>,
+    initial_notes: Option<OOBNotes>,
+
+    #[arg(
+        long,
+        help = "Gateway Id. If none, retrieve one according to --generate-invoice-with"
+    )]
+    gateway_id: Option<String>,
 
     #[arg(
         long,
@@ -168,6 +177,70 @@ struct LoadTestArgs {
         default_value = "1000"
     )]
     invoice_amount: Amount,
+}
+
+#[derive(Args, Clone)]
+struct LnCircularLoadTestArgs {
+    #[arg(
+        long,
+        help = "Federation invite code. If none given, we assume the client already has a config downloaded in DB"
+    )]
+    invite_code: Option<InviteCode>,
+
+    #[arg(
+        long,
+        help = "Notes for the test. If none and no funds on archive, will call fedimint-cli spend"
+    )]
+    initial_notes: Option<OOBNotes>,
+
+    #[arg(
+        long,
+        default_value = "60",
+        help = "For how many seconds to run the test"
+    )]
+    test_duration_secs: u64,
+
+    #[arg(
+        long,
+        default_value = "0",
+        help = "How many seconds to sleep between LN payments"
+    )]
+    ln_payment_sleep_secs: u64,
+
+    #[arg(
+        long,
+        help = "How many notes to distribute to each user",
+        default_value = "1"
+    )]
+    notes_per_user: u16,
+
+    #[arg(
+        long,
+        help = "Note denomination to use for the test",
+        default_value = "1024"
+    )]
+    note_denomination: Amount,
+
+    #[arg(
+        long,
+        help = "Invoice amount when generating one",
+        default_value = "1000"
+    )]
+    invoice_amount: Amount,
+
+    #[arg(long)]
+    strategy: LnCircularStrategy,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LnCircularStrategy {
+    /// The user will pay its own invoice
+    SelfPayment,
+    /// One gateway will pay/receive to/from the other, then they will swap
+    /// places
+    TwoGateways,
+    /// Two clients will pay to each other using the same gateway
+    PartnerPingPong,
 }
 
 #[derive(Debug, Clone)]
@@ -222,20 +295,20 @@ async fn main() -> anyhow::Result<()> {
     fedimint_logging::TracingSetup::default().init()?;
     let opts = Opts::parse();
     let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let summary_handle = tokio::spawn({
+    let summary_handle = spawn("handle metrics summary", {
         let opts = opts.clone();
-        async move { handle_metrics_summary(opts, event_receiver).await }
+        async { handle_metrics_summary(opts, event_receiver).await }
     });
     let futures = match opts.command.clone() {
         Command::TestConnect {
-            connect_common_args,
+            invite_code,
             duration_secs,
             timeout_secs,
             limit_endpoints,
         } => {
-            let cfg = get_cfg_from_args(&connect_common_args).await?;
+            let invite_code = InviteCode::from_str(&invite_code).context("invalid invite code")?;
             test_connect_raw_client(
-                cfg,
+                invite_code,
                 opts.users,
                 Duration::from_secs(duration_secs),
                 Duration::from_secs(timeout_secs),
@@ -244,30 +317,28 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Command::TestDownload { connect } => {
-            test_download_config(&connect, opts.users, event_sender.clone()).await?
+        Command::TestDownload { invite_code } => {
+            let invite_code = InviteCode::from_str(&invite_code).context("invalid invite code")?;
+            test_download_config(&invite_code, opts.users, &event_sender.clone())
         }
         Command::LoadTest(args) => {
-            let cfg = get_cfg_from_args(&args.connect_common_args).await?;
-            let initial_notes = if let Some(initial_notes) = args.initial_notes {
-                initial_notes
-            } else {
-                try_get_notes_cli(&Amount::from_sats(2000), 5).await?
-            };
+            let invite_code = invite_code_or_fallback(args.invite_code).await;
 
-            let gateway_public_key = if let Some(gateway_public_key) = args.gateway_public_key {
-                Some(gateway_public_key)
+            let gateway_id = if let Some(gateway_id) = args.gateway_id {
+                Some(gateway_id)
             } else if let Some(generate_invoice_with) = args.generate_invoice_with {
-                Some(get_gateway_public_key(generate_invoice_with).await?)
+                Some(get_gateway_id(generate_invoice_with).await?)
             } else {
                 None
             };
             let invoices = if let Some(invoices_file) = args.invoices_file {
-                let invoices_file = tokio::fs::File::open(invoices_file).await?;
+                let invoices_file = tokio::fs::File::open(&invoices_file)
+                    .await
+                    .with_context(|| format!("Failed to open {invoices_file:?}"))?;
                 let mut lines = tokio::io::BufReader::new(invoices_file).lines();
                 let mut invoices = vec![];
                 while let Some(line) = lines.next_line().await? {
-                    let invoice = Invoice::from_str(&line)?;
+                    let invoice = Bolt11Invoice::from_str(&line)?;
                     invoices.push(invoice);
                 }
                 invoices
@@ -275,21 +346,40 @@ async fn main() -> anyhow::Result<()> {
                 vec![]
             };
             if args.generate_invoice_with.is_none() && invoices.is_empty() {
-                info!("No --generate-invoice-with given no invoices on --invoices-file, not LN/gateway tests will be run")
+                info!(
+                    "No --generate-invoice-with given no invoices on --invoices-file, not LN/gateway tests will be run"
+                );
             }
             run_load_test(
                 opts.archive_dir,
                 opts.users,
-                cfg,
-                initial_notes,
+                invite_code,
+                args.initial_notes,
                 args.generate_invoice_with,
                 args.invoices_per_user,
                 Duration::from_secs(args.ln_payment_sleep_secs),
                 invoices,
-                gateway_public_key,
+                gateway_id,
                 args.notes_per_user,
                 args.note_denomination,
                 args.invoice_amount,
+                event_sender.clone(),
+            )
+            .await?
+        }
+        Command::LnCircularLoadTest(args) => {
+            let invite_code = invite_code_or_fallback(args.invite_code).await;
+            run_ln_circular_load_test(
+                opts.archive_dir,
+                opts.users,
+                invite_code,
+                args.initial_notes,
+                Duration::from_secs(args.test_duration_secs),
+                Duration::from_secs(args.ln_payment_sleep_secs),
+                args.notes_per_user,
+                args.note_denomination,
+                args.invoice_amount,
+                args.strategy,
                 event_sender.clone(),
             )
             .await?
@@ -308,74 +398,62 @@ async fn main() -> anyhow::Result<()> {
     }
     if len_failures > 0 {
         bail!("Finished with failures");
-    } else {
-        info!("Finished successfully")
     }
+    info!("Finished successfully");
     Ok(())
+}
+
+async fn invite_code_or_fallback(invite_code: Option<InviteCode>) -> Option<InviteCode> {
+    if let Some(invite_code) = invite_code {
+        Some(invite_code)
+    } else {
+        // Try to get an invite code through cli in a best effort basis
+        match get_invite_code_cli(0.into()).await {
+            Ok(invite_code) => Some(invite_code),
+            Err(e) => {
+                info!(
+                    "No invite code provided and failed to get one with '{e}' error, will try to proceed without one..."
+                );
+                None
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_load_test(
     archive_dir: Option<PathBuf>,
     users: u16,
-    cfg: ClientConfig,
-    initial_notes: TieredMulti<SpendableNote>,
+    invite_code: Option<InviteCode>,
+    initial_notes: Option<OOBNotes>,
     generate_invoice_with: Option<LnInvoiceGeneration>,
     generated_invoices_per_user: u16,
     ln_payment_sleep: Duration,
-    invoices_from_file: Vec<Invoice>,
-    gateway_public_key: Option<String>,
+    invoices_from_file: Vec<Bolt11Invoice>,
+    gateway_id: Option<String>,
     notes_per_user: u16,
     note_denomination: Amount,
     invoice_amount: Amount,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
-    let mut tg = TaskGroup::new();
-    let db_path = archive_dir.as_ref().map(|p| p.join("db"));
-    let coordinator_db = if let Some(db_path) = &db_path {
-        tokio::fs::create_dir_all(db_path).await?;
-        Some(db_path.join("coordinator.db"))
-    } else {
-        None
-    };
-    let coordinator = build_client(&cfg, &mut tg, coordinator_db.as_ref()).await?;
-    let mut users_clients = Vec::with_capacity(users.into());
-    for u in 0..users {
-        let user_db = db_path
-            .as_ref()
-            .map(|db_path| db_path.join(format!("user_{u}.db")));
-        let client = build_client(&cfg, &mut tg, user_db.as_ref()).await?;
-        if let Some(gateway_public_key) = &gateway_public_key {
-            switch_default_gateway(&client, gateway_public_key).await?;
-        }
-        users_clients.push(client);
-    }
+    let db_path = get_db_path(&archive_dir);
+    let (coordinator, invite_code) = get_coordinator_client(&db_path, &invite_code).await?;
+    let minimum_notes = notes_per_user * users;
+    let minimum_amount_required = note_denomination * u64::from(minimum_notes);
 
-    let amount = initial_notes.total_amount();
+    reissue_initial_notes(initial_notes, &coordinator, &event_sender).await?;
+    get_required_notes(&coordinator, minimum_amount_required, &event_sender).await?;
+    print_coordinator_notes(&coordinator).await?;
+    info!(
+        "Reminting {minimum_notes} notes of denomination {note_denomination} for {users} users, {notes_per_user} notes per user (this may take a while if the number of users/notes is high)"
+    );
+    remint_denomination(&coordinator, note_denomination, minimum_notes).await?;
+    print_coordinator_notes(&coordinator).await?;
 
-    info!("Reissuing initial notes: initial {amount}");
-    reissue_notes(&coordinator, initial_notes, &event_sender).await?;
+    let users_clients = get_users_clients(users, db_path, invite_code).await?;
 
-    info!("Reminting notes of denomination {note_denomination} for {users} users, {notes_per_user} notes per user (this may take a while if the number of users/notes is high)");
-    let total_quantity_to_remint = notes_per_user * users;
-    remint_denomination(&coordinator, note_denomination, total_quantity_to_remint).await?;
-
-    info!("Note summary:");
-    let summary = get_note_summary(&coordinator).await?;
-    for (k, v) in summary.iter() {
-        info!("{k}: {v}");
-    }
-
-    let mut users_notes = HashMap::new();
-    for u in 0..users {
-        users_notes.insert(u, Vec::with_capacity(notes_per_user.into()));
-        for _ in 0..notes_per_user {
-            let (_, notes) = do_spend_notes(&coordinator, note_denomination).await?;
-            let user_amount = notes.total_amount();
-            info!("Giving {user_amount} to user {u}");
-            users_notes.get_mut(&u).unwrap().push(notes);
-        }
-    }
+    let mut users_notes =
+        get_notes_for_users(users, notes_per_user, coordinator, note_denomination).await?;
     let mut users_invoices = HashMap::new();
     let mut user = 0;
     // Distribute invoices to users in a round robin fashion
@@ -393,18 +471,20 @@ async fn run_load_test(
         .enumerate()
         .map(|(u, client)| {
             let u = u as u16;
-            let notes = users_notes.remove(&u).unwrap();
+            let oob_notes = users_notes.remove(&u).unwrap();
             let invoices = users_invoices.remove(&u).unwrap_or_default();
             let event_sender = event_sender.clone();
-            let f: BoxFuture<_> = Box::pin(do_user_task(
+            let f: BoxFuture<_> = Box::pin(do_load_test_user_task(
+                format!("User {u}:"),
                 client,
-                notes,
+                oob_notes,
                 generated_invoices_per_user,
                 ln_payment_sleep,
                 invoice_amount,
                 invoices,
                 generate_invoice_with,
                 event_sender,
+                gateway_id.clone(),
             ));
             f
         })
@@ -413,25 +493,177 @@ async fn run_load_test(
     Ok(futures)
 }
 
+async fn get_notes_for_users(
+    users: u16,
+    notes_per_user: u16,
+    coordinator: ClientHandleArc,
+    note_denomination: Amount,
+) -> anyhow::Result<HashMap<u16, Vec<OOBNotes>>> {
+    let mut users_notes = HashMap::new();
+    for u in 0..users {
+        users_notes.insert(u, Vec::with_capacity(notes_per_user.into()));
+        for _ in 0..notes_per_user {
+            let (_, oob_notes) = do_spend_notes(&coordinator, note_denomination).await?;
+            let user_amount = oob_notes.total_amount();
+            info!("Giving {user_amount} to user {u}");
+            users_notes.get_mut(&u).unwrap().push(oob_notes);
+        }
+    }
+    Ok(users_notes)
+}
+
+async fn get_users_clients(
+    n: u16,
+    db_path: Option<PathBuf>,
+    invite_code: Option<InviteCode>,
+) -> anyhow::Result<Vec<ClientHandleArc>> {
+    let mut users_clients = Vec::with_capacity(n.into());
+    for u in 0..n {
+        let (client, _) = get_user_client(u, &db_path, &invite_code).await?;
+        users_clients.push(client);
+    }
+    Ok(users_clients)
+}
+
+async fn get_user_client(
+    user_index: u16,
+    db_path: &Option<PathBuf>,
+    invite_code: &Option<InviteCode>,
+) -> anyhow::Result<(ClientHandleArc, Option<InviteCode>)> {
+    let user_db = db_path
+        .as_ref()
+        .map(|db_path| db_path.join(format!("user_{user_index}.db")));
+    let user_invite_code = if user_db.as_ref().is_some_and(|db| db.exists()) {
+        None
+    } else {
+        invite_code.clone()
+    };
+    let (client, invite_code) = build_client(user_invite_code, user_db.as_ref()).await?;
+    // if lightning module is present, update the gateway cache
+    if let Ok(ln_client) = client.get_first_module::<LightningClientModule>() {
+        let _ = ln_client.update_gateway_cache().await;
+    }
+    Ok((client, invite_code))
+}
+
+async fn print_coordinator_notes(coordinator: &ClientHandleArc) -> anyhow::Result<()> {
+    info!("Note summary:");
+    let summary = get_note_summary(coordinator).await?;
+    for (k, v) in summary.iter() {
+        info!("{k}: {v}");
+    }
+    Ok(())
+}
+
+async fn get_required_notes(
+    coordinator: &ClientHandleArc,
+    minimum_amount_required: Amount,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+) -> anyhow::Result<()> {
+    let current_balance = coordinator.get_balance().await;
+    if current_balance < minimum_amount_required {
+        let diff = minimum_amount_required.saturating_sub(current_balance);
+        info!(
+            "Current balance {current_balance} on coordinator not enough, trying to get {diff} more through fedimint-cli"
+        );
+        match try_get_notes_cli(&diff, 5).await {
+            Ok(notes) => {
+                info!("Got {} more notes, reissuing them", notes.total_amount());
+                reissue_notes(coordinator, notes, event_sender).await?;
+            }
+            Err(e) => {
+                info!("Unable to get more notes: '{e}', will try to proceed without them");
+            }
+        };
+    } else {
+        info!(
+            "Current balance of {current_balance} already covers the minimum required of {minimum_amount_required}"
+        );
+    }
+    Ok(())
+}
+
+async fn reissue_initial_notes(
+    initial_notes: Option<OOBNotes>,
+    coordinator: &ClientHandleArc,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+) -> anyhow::Result<()> {
+    if let Some(notes) = initial_notes {
+        let amount = notes.total_amount();
+        info!("Reissuing initial notes, got {amount}");
+        reissue_notes(coordinator, notes, event_sender).await?;
+    }
+    Ok(())
+}
+
+async fn get_coordinator_client(
+    db_path: &Option<PathBuf>,
+    invite_code: &Option<InviteCode>,
+) -> anyhow::Result<(ClientHandleArc, Option<InviteCode>)> {
+    let (client, invite_code) = if let Some(db_path) = db_path {
+        let coordinator_db = db_path.join("coordinator.db");
+        if coordinator_db.exists() {
+            build_client(invite_code.clone(), Some(&coordinator_db)).await?
+        } else {
+            tokio::fs::create_dir_all(db_path).await?;
+            build_client(
+                Some(invite_code.clone().context(
+                    "Running on this archive dir for the first time, an invite code is required",
+                )?),
+                Some(&coordinator_db),
+            )
+            .await?
+        }
+    } else {
+        build_client(
+            Some(
+                invite_code
+                    .clone()
+                    .context("No archive dir given, an invite code is strictly required")?,
+            ),
+            None,
+        )
+        .await?
+    };
+    Ok((client, invite_code))
+}
+
+fn get_db_path(archive_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    archive_dir.as_ref().map(|p| p.join("db"))
+}
+
+async fn get_lightning_gateway(
+    client: &ClientHandleArc,
+    gateway_id: Option<String>,
+) -> Option<LightningGateway> {
+    let gateway_id = parse_gateway_id(gateway_id.or(None)?.as_str()).expect("Invalid gateway id");
+    let ln_module = client
+        .get_first_module::<LightningClientModule>()
+        .expect("Must have ln client module");
+    ln_module.select_gateway(&gateway_id).await
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn do_user_task(
-    client: Client,
-    notes: Vec<TieredMulti<SpendableNote>>,
+async fn do_load_test_user_task(
+    prefix: String,
+    client: ClientHandleArc,
+    oob_notes: Vec<OOBNotes>,
     generated_invoices_per_user: u16,
     ln_payment_sleep: Duration,
     invoice_amount: Amount,
-    additional_invoices: Vec<Invoice>,
+    additional_invoices: Vec<Bolt11Invoice>,
     generate_invoice_with: Option<LnInvoiceGeneration>,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
+    gateway_id: Option<String>,
 ) -> anyhow::Result<()> {
-    for note in notes {
-        let amount = note.total_amount();
-        reissue_notes(&client, note, &event_sender)
+    let ln_gateway = get_lightning_gateway(&client, gateway_id).await;
+    for oob_note in oob_notes {
+        let amount = oob_note.total_amount();
+        reissue_notes(&client, oob_note, &event_sender)
             .await
             .map_err(|e| anyhow::anyhow!("while reissuing initial {amount}: {e}"))?;
     }
-    let mut generated_invoices_per_user_iterator =
-        (0..generated_invoices_per_user).into_iter().peekable();
+    let mut generated_invoices_per_user_iterator = (0..generated_invoices_per_user).peekable();
     while let Some(_) = generated_invoices_per_user_iterator.next() {
         let total_amount = get_note_summary(&client).await?.total_amount();
         if invoice_amount > total_amount {
@@ -440,16 +672,21 @@ async fn do_user_task(
             match generate_invoice_with {
                 Some(LnInvoiceGeneration::ClnLightningCli) => {
                     let (invoice, label) = cln_create_invoice(invoice_amount).await?;
-                    gateway_pay_invoice(&client, invoice, &event_sender).await?;
+                    gateway_pay_invoice(
+                        &prefix,
+                        "LND",
+                        &client,
+                        invoice,
+                        &event_sender,
+                        ln_gateway.clone(),
+                    )
+                    .await?;
                     cln_wait_invoice_payment(&label).await?;
                 }
-                Some(LnInvoiceGeneration::LnCli) => {
-                    let (invoice, r_hash) = lnd_create_invoice(invoice_amount).await?;
-                    gateway_pay_invoice(&client, invoice, &event_sender).await?;
-                    lnd_wait_invoice_payment(r_hash).await?;
-                }
                 None if additional_invoices.is_empty() => {
-                    debug!("No method given to generate an invoice and no invoices on file, will not test the gateway");
+                    debug!(
+                        "No method given to generate an invoice and no invoices on file, will not test the gateway"
+                    );
                     break;
                 }
                 None => {
@@ -472,7 +709,15 @@ async fn do_user_task(
         } else if invoice_amount == Amount::ZERO {
             warn!("Can't pay invoice {invoice}, amount is zero");
         } else {
-            gateway_pay_invoice(&client, invoice, &event_sender).await?;
+            gateway_pay_invoice(
+                &prefix,
+                "unknown",
+                &client,
+                invoice,
+                &event_sender,
+                ln_gateway.clone(),
+            )
+            .await?;
             if additional_invoices.peek().is_some() {
                 // Only sleep while there are more invoices to pay
                 fedimint_core::task::sleep(ln_payment_sleep).await;
@@ -482,23 +727,347 @@ async fn do_user_task(
     Ok(())
 }
 
-async fn test_download_config(
-    connect: &str,
+#[allow(clippy::too_many_arguments)]
+async fn run_ln_circular_load_test(
+    archive_dir: Option<PathBuf>,
     users: u16,
+    invite_code: Option<InviteCode>,
+    initial_notes: Option<OOBNotes>,
+    test_duration: Duration,
+    ln_payment_sleep: Duration,
+    notes_per_user: u16,
+    note_denomination: Amount,
+    invoice_amount: Amount,
+    strategy: LnCircularStrategy,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
-    let connect_obj: WsClientConnectInfo =
-        WsClientConnectInfo::from_str(connect).context("invalid connect info")?;
-    let api = Arc::new(WsFederationApi::from_connect_info(&[connect_obj.clone()]));
+    let db_path = get_db_path(&archive_dir);
+    let (coordinator, invite_code) = get_coordinator_client(&db_path, &invite_code).await?;
+    let minimum_notes = notes_per_user * users;
+    let minimum_amount_required = note_denomination * u64::from(minimum_notes);
 
-    Ok((0..users)
+    reissue_initial_notes(initial_notes, &coordinator, &event_sender).await?;
+    get_required_notes(&coordinator, minimum_amount_required, &event_sender).await?;
+
+    info!(
+        "Reminting {minimum_notes} notes of denomination {note_denomination} for {users} users, {notes_per_user} notes per user (this may take a while if the number of users/notes is high)"
+    );
+    remint_denomination(&coordinator, note_denomination, minimum_notes).await?;
+
+    print_coordinator_notes(&coordinator).await?;
+
+    let users_clients = get_users_clients(users, db_path, invite_code.clone()).await?;
+
+    let mut users_notes =
+        get_notes_for_users(users, notes_per_user, coordinator, note_denomination).await?;
+
+    info!("Starting user tasks");
+    let futures = users_clients
+        .into_iter()
+        .enumerate()
+        .map(|(u, client)| {
+            let u = u as u16;
+            let oob_notes = users_notes.remove(&u).unwrap();
+            let event_sender = event_sender.clone();
+            let f: BoxFuture<_> = Box::pin(do_ln_circular_test_user_task(
+                format!("User {u}:"),
+                client,
+                invite_code.clone(),
+                oob_notes,
+                test_duration,
+                ln_payment_sleep,
+                invoice_amount,
+                strategy,
+                event_sender,
+            ));
+            f
+        })
+        .collect::<Vec<_>>();
+
+    Ok(futures)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_ln_circular_test_user_task(
+    prefix: String,
+    client: ClientHandleArc,
+    invite_code: Option<InviteCode>,
+    oob_notes: Vec<OOBNotes>,
+    test_duration: Duration,
+    ln_payment_sleep: Duration,
+    invoice_amount: Amount,
+    strategy: LnCircularStrategy,
+    event_sender: mpsc::UnboundedSender<MetricEvent>,
+) -> anyhow::Result<()> {
+    for oob_note in oob_notes {
+        let amount = oob_note.total_amount();
+        reissue_notes(&client, oob_note, &event_sender)
+            .await
+            .map_err(|e| anyhow::anyhow!("while reissuing initial {amount}: {e}"))?;
+    }
+    let initial_time = fedimint_core::time::now();
+    let still_ontime = || async {
+        fedimint_core::time::now()
+            .duration_since(initial_time)
+            .expect("time to work")
+            <= test_duration
+    };
+    let sleep_a_bit = || async {
+        if still_ontime().await {
+            fedimint_core::task::sleep(ln_payment_sleep).await;
+        }
+    };
+    match strategy {
+        LnCircularStrategy::TwoGateways => {
+            let invoice_generation = LnInvoiceGeneration::ClnLightningCli;
+            while still_ontime().await {
+                let gateway_id = get_gateway_id(invoice_generation).await?;
+                let ln_gateway = get_lightning_gateway(&client, Some(gateway_id)).await;
+                run_two_gateways_strategy(
+                    &prefix,
+                    &invoice_generation,
+                    &invoice_amount,
+                    &event_sender,
+                    &client,
+                    ln_gateway,
+                )
+                .await?;
+                sleep_a_bit().await;
+            }
+        }
+        LnCircularStrategy::SelfPayment => {
+            while still_ontime().await {
+                do_self_payment(&prefix, &client, invoice_amount, &event_sender).await?;
+                sleep_a_bit().await;
+            }
+        }
+        LnCircularStrategy::PartnerPingPong => {
+            let (partner, _) = build_client(invite_code, None).await?;
+            while still_ontime().await {
+                do_partner_ping_pong(&prefix, &client, &partner, invoice_amount, &event_sender)
+                    .await?;
+                sleep_a_bit().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+const GATEWAY_CREATE_INVOICE: &str = "gateway_create_invoice";
+
+async fn run_two_gateways_strategy(
+    prefix: &str,
+    invoice_generation: &LnInvoiceGeneration,
+    invoice_amount: &Amount,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+    client: &ClientHandleArc,
+    ln_gateway: Option<LightningGateway>,
+) -> Result<(), anyhow::Error> {
+    let create_invoice_time = fedimint_core::time::now();
+    match *invoice_generation {
+        LnInvoiceGeneration::ClnLightningCli => {
+            let (invoice, label) = cln_create_invoice(*invoice_amount).await?;
+            let elapsed = create_invoice_time.elapsed()?;
+            info!("Created invoice using CLN in {elapsed:?}");
+            event_sender.send(MetricEvent {
+                name: GATEWAY_CREATE_INVOICE.into(),
+                duration: elapsed,
+            })?;
+            gateway_pay_invoice(
+                prefix,
+                "LND",
+                client,
+                invoice,
+                event_sender,
+                ln_gateway.clone(),
+            )
+            .await?;
+            cln_wait_invoice_payment(&label).await?;
+            let (operation_id, invoice) =
+                client_create_invoice(client, *invoice_amount, event_sender, ln_gateway).await?;
+            let pay_invoice_time = fedimint_core::time::now();
+            cln_pay_invoice(invoice).await?;
+            wait_invoice_payment(
+                prefix,
+                "LND",
+                client,
+                operation_id,
+                event_sender,
+                pay_invoice_time,
+            )
+            .await?;
+        }
+    };
+    Ok(())
+}
+
+async fn do_self_payment(
+    prefix: &str,
+    client: &ClientHandleArc,
+    invoice_amount: Amount,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+) -> anyhow::Result<()> {
+    let (operation_id, invoice) =
+        client_create_invoice(client, invoice_amount, event_sender, None).await?;
+    let pay_invoice_time = fedimint_core::time::now();
+    let lightning_module = client.get_first_module::<LightningClientModule>()?;
+    //let gateway = lightning_module.select_active_gateway_opt().await;
+    lightning_module
+        .pay_bolt11_invoice(None, invoice, ())
+        .await?;
+    wait_invoice_payment(
+        prefix,
+        "gateway",
+        client,
+        operation_id,
+        event_sender,
+        pay_invoice_time,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn do_partner_ping_pong(
+    prefix: &str,
+    client: &ClientHandleArc,
+    partner: &ClientHandleArc,
+    invoice_amount: Amount,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+) -> anyhow::Result<()> {
+    // Ping (partner creates invoice, client pays)
+    let (operation_id, invoice) =
+        client_create_invoice(partner, invoice_amount, event_sender, None).await?;
+    let pay_invoice_time = fedimint_core::time::now();
+    let lightning_module = client.get_first_module::<LightningClientModule>()?;
+    // TODO: Select random gateway?
+    //let gateway = lightning_module.select_active_gateway_opt().await;
+    lightning_module
+        .pay_bolt11_invoice(None, invoice, ())
+        .await?;
+    wait_invoice_payment(
+        prefix,
+        "gateway",
+        partner,
+        operation_id,
+        event_sender,
+        pay_invoice_time,
+    )
+    .await?;
+    // Pong (client creates invoice, partner pays)
+    let (operation_id, invoice) =
+        client_create_invoice(client, invoice_amount, event_sender, None).await?;
+    let pay_invoice_time = fedimint_core::time::now();
+    let partner_lightning_module = partner.get_first_module::<LightningClientModule>()?;
+    //let gateway = partner_lightning_module.select_active_gateway_opt().await;
+    // TODO: Select random gateway?
+    partner_lightning_module
+        .pay_bolt11_invoice(None, invoice, ())
+        .await?;
+    wait_invoice_payment(
+        prefix,
+        "gateway",
+        client,
+        operation_id,
+        event_sender,
+        pay_invoice_time,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn wait_invoice_payment(
+    prefix: &str,
+    gateway_name: &str,
+    client: &ClientHandleArc,
+    operation_id: fedimint_core::core::OperationId,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+    pay_invoice_time: std::time::SystemTime,
+) -> anyhow::Result<()> {
+    let elapsed = pay_invoice_time.elapsed()?;
+    info!("{prefix} Invoice payment receive started using {gateway_name} in {elapsed:?}");
+    event_sender.send(MetricEvent {
+        name: format!("gateway_{gateway_name}_payment_received_started"),
+        duration: elapsed,
+    })?;
+    let lightning_module = client.get_first_module::<LightningClientModule>()?;
+    let mut updates = lightning_module
+        .subscribe_ln_receive(operation_id)
+        .await?
+        .into_stream();
+    while let Some(update) = updates.next().await {
+        debug!(%prefix, ?update, "Invoice payment update");
+        match update {
+            LnReceiveState::Claimed => {
+                let elapsed: Duration = pay_invoice_time.elapsed()?;
+                info!("{prefix} Invoice payment received on {gateway_name} in {elapsed:?}");
+                event_sender.send(MetricEvent {
+                    name: "gateway_payment_received_success".into(),
+                    duration: elapsed,
+                })?;
+                event_sender.send(MetricEvent {
+                    name: format!("gateway_{gateway_name}_payment_received_success"),
+                    duration: elapsed,
+                })?;
+                break;
+            }
+            LnReceiveState::Canceled { reason } => {
+                let elapsed: Duration = pay_invoice_time.elapsed()?;
+                info!(
+                    "{prefix} Invoice payment receive was canceled on {gateway_name}: {reason} in {elapsed:?}"
+                );
+                event_sender.send(MetricEvent {
+                    name: "gateway_payment_received_canceled".into(),
+                    duration: elapsed,
+                })?;
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn client_create_invoice(
+    client: &ClientHandleArc,
+    invoice_amount: Amount,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+    ln_gateway: Option<LightningGateway>,
+) -> anyhow::Result<(fedimint_core::core::OperationId, Bolt11Invoice)> {
+    let create_invoice_time = fedimint_core::time::now();
+    let lightning_module = client.get_first_module::<LightningClientModule>()?;
+    let desc = Description::new("test".to_string())?;
+    let (operation_id, invoice, _) = lightning_module
+        .create_bolt11_invoice(
+            invoice_amount,
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            (),
+            ln_gateway,
+        )
+        .await?;
+    let elapsed = create_invoice_time.elapsed()?;
+    info!("Created invoice using gateway in {elapsed:?}");
+    event_sender.send(MetricEvent {
+        name: GATEWAY_CREATE_INVOICE.into(),
+        duration: elapsed,
+    })?;
+    Ok((operation_id, invoice))
+}
+
+fn test_download_config(
+    invite_code: &InviteCode,
+    users: u16,
+    event_sender: &mpsc::UnboundedSender<MetricEvent>,
+) -> Vec<BoxFuture<'static, anyhow::Result<()>>> {
+    (0..users)
         .map(|_| {
-            let api = api.clone();
-            let connect_obj = connect_obj.clone();
+            let invite_code = invite_code.clone();
             let event_sender = event_sender.clone();
             let f: BoxFuture<_> = Box::pin(async move {
                 let m = fedimint_core::time::now();
-                let _ = api.download_client_config(&connect_obj).await?;
+                let _ = fedimint_api_client::api::net::Connector::default()
+                    .download_from_invite_code(&invite_code)
+                    .await?;
                 event_sender.send(MetricEvent {
                     name: "download_client_config".into(),
                     duration: m.elapsed()?,
@@ -507,80 +1076,39 @@ async fn test_download_config(
             });
             f
         })
-        .collect())
-}
-
-async fn _test_connect_std_client(
-    mut cfg: ClientConfig,
-    users: u16,
-    duration: Duration,
-    limit_endpoints: Option<usize>,
-    event_sender: mpsc::UnboundedSender<MetricEvent>,
-) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
-    if let Some(limit_endpoints) = limit_endpoints {
-        cfg.api_endpoints = cfg
-            .api_endpoints
-            .into_iter()
-            .take(limit_endpoints)
-            .collect();
-        info!("Limiting endpoints to {:?}", cfg.api_endpoints);
-    }
-    let clients = (0..users)
-        .map(|_| async {
-            let mut tg = TaskGroup::new();
-            let client = build_client(&cfg, &mut tg, None).await?;
-            Ok::<_, anyhow::Error>(client)
-        })
-        .collect::<Vec<_>>();
-    let clients = futures::future::try_join_all(clients).await?;
-    info!("Keeping {users} clients connected for {duration:?}");
-    Ok(clients
-        .into_iter()
-        .map(|client| {
-            let event_sender = event_sender.clone();
-            let f: BoxFuture<_> = Box::pin(async move {
-                let initial_time = fedimint_core::time::now();
-                while initial_time.elapsed()? < duration {
-                    let m = fedimint_core::time::now();
-                    client.api().fetch_epoch_count().await?;
-                    event_sender.send(MetricEvent {
-                        name: "fetch_epoch_count".into(),
-                        duration: m.elapsed()?,
-                    })?;
-                    fedimint_core::task::sleep(Duration::from_secs(1)).await;
-                }
-                Ok(())
-            });
-            f
-        })
-        .collect())
+        .collect()
 }
 
 async fn test_connect_raw_client(
-    mut cfg: ClientConfig,
+    invite_code: InviteCode,
     users: u16,
     duration: Duration,
     timeout: Duration,
     limit_endpoints: Option<usize>,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
+    use jsonrpsee_core::client::ClientT;
+    use jsonrpsee_ws_client::WsClientBuilder;
+
+    let mut cfg = fedimint_api_client::api::net::Connector::default()
+        .download_from_invite_code(&invite_code)
+        .await?;
+
     if let Some(limit_endpoints) = limit_endpoints {
-        cfg.api_endpoints = cfg
+        cfg.global.api_endpoints = cfg
+            .global
             .api_endpoints
             .into_iter()
             .take(limit_endpoints)
             .collect();
-        info!("Limiting endpoints to {:?}", cfg.api_endpoints);
+        info!("Limiting endpoints to {:?}", cfg.global.api_endpoints);
     }
-    use jsonrpsee_core::client::ClientT;
-    use jsonrpsee_ws_client::WsClientBuilder;
 
     info!("Connecting to {users} clients");
     let clients = (0..users)
         .flat_map(|_| {
-            let clients = cfg.api_endpoints.values().into_iter().map(|url| async {
+            let clients = cfg.global.api_endpoints.values().map(|url| async {
                 let ws_client = WsClientBuilder::default()
-                    .use_webpki_rustls()
                     .request_timeout(timeout)
                     .connection_timeout(timeout)
                     .build(url_to_string_with_default_port(&url.url))
@@ -601,10 +1129,10 @@ async fn test_connect_raw_client(
                 while initial_time.elapsed()? < duration {
                     let m = fedimint_core::time::now();
                     let _epoch: u64 = client
-                        .request::<_, _>("fetch_epoch_count", vec![ApiRequestErased::default()])
+                        .request::<_, _>(SESSION_COUNT_ENDPOINT, vec![ApiRequestErased::default()])
                         .await?;
                     event_sender.send(MetricEvent {
-                        name: "fetch_epoch_count".into(),
+                        name: SESSION_COUNT_ENDPOINT.into(),
                         duration: m.elapsed()?,
                     })?;
                     fedimint_core::task::sleep(Duration::from_secs(1)).await;
@@ -616,7 +1144,7 @@ async fn test_connect_raw_client(
         .collect())
 }
 
-fn url_to_string_with_default_port(url: &url::Url) -> String {
+fn url_to_string_with_default_port(url: &SafeUrl) -> String {
     format!(
         "{}://{}:{}{}",
         url.scheme(),
@@ -631,10 +1159,7 @@ async fn handle_metrics_summary(
     opts: Opts,
     mut event_receiver: mpsc::UnboundedReceiver<MetricEvent>,
 ) -> anyhow::Result<()> {
-    let timestamp_seconds = fedimint_core::time::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp_seconds = fedimint_core::time::duration_since_epoch().as_secs();
     let mut metrics_json_output_files = vec![];
     let mut previous_metrics = vec![];
     let mut comparison_output = None;
@@ -658,7 +1183,9 @@ async fn handle_metrics_summary(
             .max_by_key(|(_entry, created)| created.to_owned())
             .map(|(entry, _)| entry.path());
         if let Some(latest_metrics_file) = latest_metrics_file {
-            let latest_metrics_file = tokio::fs::File::open(latest_metrics_file).await?;
+            let latest_metrics_file = tokio::fs::File::open(&latest_metrics_file)
+                .await
+                .with_context(|| format!("Failed to open {latest_metrics_file:?}"))?;
             let mut lines = tokio::io::BufReader::new(latest_metrics_file).lines();
             while let Some(line) = lines.next_line().await? {
                 match serde_json::from_str::<EventMetricSummary>(&line) {
@@ -696,21 +1223,23 @@ async fn handle_metrics_summary(
     }
     if let Some(metrics_json_output) = opts.metrics_json_output {
         metrics_json_output_files.push(BufWriter::new(
-            tokio::fs::File::create(metrics_json_output).await?,
-        ))
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(metrics_json_output)
+                .await?,
+        ));
     }
-
-    let mut results = HashMap::new();
+    let mut results = BTreeMap::new();
     while let Some(event) = event_receiver.recv().await {
         let entry = results.entry(event.name).or_insert_with(Vec::new);
         entry.push(event.duration);
     }
-
     let mut previous_metrics = previous_metrics
         .into_iter()
         .map(|metric| (metric.name.clone(), metric))
         .collect::<HashMap<_, _>>();
-
     for (k, mut v) in results {
         v.sort();
         let n = v.len();
@@ -721,7 +1250,7 @@ async fn handle_metrics_summary(
         let avg = sum / n as u32;
         let metric_summary = EventMetricSummary {
             name: k.clone(),
-            users: opts.users as u64,
+            users: u64::from(opts.users),
             n: n as u64,
             avg_ms: avg.as_millis(),
             median_ms: median.as_millis(),
@@ -755,14 +1284,19 @@ async fn handle_metrics_summary(
                 }
                 Some(comparison)
             } else {
-                info!("Skipping comparison for {k} because previous metric has different n ({} vs {})", previous_metric.n, metric_summary.n);
+                info!(
+                    "Skipping comparison for {k} because previous metric has different n ({} vs {})",
+                    previous_metric.n, metric_summary.n
+                );
                 None
             }
         } else {
             None
         };
         if let Some(comparison) = comparison {
-            println!("{n} {k}: avg {avg:?}, median {median:?}, max {max:?}, min {min:?} (compared to previous: {comparison})");
+            println!(
+                "{n} {k}: avg {avg:?}, median {median:?}, max {max:?}, min {min:?} (compared to previous: {comparison})"
+            );
         } else {
             println!("{n} {k}: avg {avg:?}, median {median:?}, max {max:?}, min {min:?}");
         }
@@ -784,43 +1318,16 @@ async fn handle_metrics_summary(
     Ok(())
 }
 
-async fn get_gateway_public_key(
-    generate_invoice_with: LnInvoiceGeneration,
-) -> anyhow::Result<String> {
+async fn get_gateway_id(generate_invoice_with: LnInvoiceGeneration) -> anyhow::Result<String> {
     let gateway_json = match generate_invoice_with {
         LnInvoiceGeneration::ClnLightningCli => {
-            // If we are paying a lnd invoice, we use the cln gateway
+            // If we are paying a lnd invoice, we use the cln node
             cmd!(GatewayLndCli, "info").out_json().await
         }
-        LnInvoiceGeneration::LnCli => {
-            // and vice-versa
-            cmd!(GatewayClnCli, "info").out_json().await
-        }
     }?;
-    let gateway_pub_key = gateway_json["federations"][0]["registration"]["gateway_pub_key"]
+    let gateway_id = gateway_json["gateway_id"]
         .as_str()
-        .context("Missing gateway_pub_key field")?;
+        .context("Missing gateway_id field")?;
 
-    Ok(gateway_pub_key.into())
-}
-
-async fn get_cfg_from_args(args: &ConnectCommonArgs) -> anyhow::Result<ClientConfig> {
-    Ok(match (&args.client_config, &args.connect) {
-        (Some(_), Some(_)) => bail!("Can't use both --client-config and --connect"),
-        (Some(client_config), None) => load_from_file(client_config)?,
-        (None, connect) => {
-            let connect = if let Some(connect) = connect {
-                connect.to_owned()
-            } else {
-                cmd!(FedimintCli, "dev", "connect-info").out_json().await?["connect_info"]
-                    .as_str()
-                    .map(ToOwned::to_owned)
-                    .expect("connect-info command to succeed")
-            };
-            let connect_obj: WsClientConnectInfo =
-                WsClientConnectInfo::from_str(&connect).context("invalid connect info")?;
-            let api = Arc::new(WsFederationApi::from_connect_info(&[connect_obj.clone()]));
-            api.download_client_config(&connect_obj).await?
-        }
-    })
+    Ok(gateway_id.into())
 }

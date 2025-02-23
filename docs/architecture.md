@@ -6,11 +6,11 @@ The current implementation allows users to make private and low-cost payments th
 All e-cash is backed by bitcoin with deposits and withdrawals that can occur on-chain or via Lightning.
 
 ## Crate organization
+
 The [Fedimint federation](#Federation-Nodes) consists of nodes that are primarily built from the following crates:
 * `fedimint` - the main consensus code for processing transactions and REST API
 * `fedimint-derive` - helper macros for serialization
 * `crypto/tbs` - helper cryptography library for threshold blind signatures
-* `integrationtests/fedimint-tests` - integration testing framework
 
 [Modules](#Modules) can be added to the `FedimintConsensus` to allow for new types of transactions and federated actions:
 * `modules/fedimint-wallet` - an on-chain bitcoin wallet
@@ -20,8 +20,7 @@ The [Fedimint federation](#Federation-Nodes) consists of nodes that are primaril
 * `fedimint-core` - common code used by both client and server
 
 The [user client](#User-Client):
-* `fedimint-client-legacy` - provides a library for sending transactions to the federation which is being phased out
-* `fedimint-client` - provides a library for sending transactions to the federation which is still being developed and will replace `fedimint-client-legacy` 
+* `fedimint-client` - provides a library for sending transactions to the federation
 * `fedimint-cli` - cli wrapper around the client library
 
 The [LN gateway](#LN-Gateway):
@@ -29,20 +28,22 @@ The [LN gateway](#LN-Gateway):
 * `gateway/cli` - provides cli access and control of a running gatewayd instance
 
 ## Federation Nodes
-Each of the nodes spawns three long-running tasks in parallel: an API task, a [HBBFT protocol](https://docs.rs/hbbft/latest/hbbft/) task, and a Fedimint consensus task.
 
-The API task in `net:api:run_server` allows clients to submit a `Transaction` and retrieve the `TransactionStatus`.
+Each of the nodes spawns three long-running tasks in parallel: an API task, an [AlephBFT protocol](https://docs.rs/aleph-bft/latest/aleph_bft/) task, and a Fedimint consensus task.
+
+The API task in `net:api:run_server` allows clients to submit a `Transaction` and retrieve its `TransactionStatus`.
 Transactions are validated by the `FedimintConsensus` logic before being stored as proposals in the database.
-The proposed list of `ConsensusItem` includes all possible consensus state changes, such as mint transactions or updates to the agreed-upon block height.
+The proposed list of `ConsensusItem`s includes all possible consensus state changes, such as mint transactions or updates to the agreed-upon block height.
 
-The HBBFT protocol task handles communication between federation nodes, combining different `ConsensusItem` proposals from each node into an identical `ConsensusOutcome` during an epoch.
+The AlephBFT protocol task handles communication between federation nodes, combining different `ConsensusItem` proposals from each node into an identical `ConsensusOutcome` during an epoch.
 So long as enough nodes can communicate, epochs will be continually generated, and every node will share the same sequence of `ConsensusOutcome` data.
 
 The `FedimintConsensus` task processes each `ConsensusOutcome` by validating the proposals, updating the database, and performing any necessary actions.
 For instance, the consensus thread may receive a peg-out proposal, validate the PSBT signature and transaction balances, then sign and submit the transaction to the Bitcoin network.
 
 ## Modules
-There currently are three `FederationModule` used in `FedimintConsensus` that exist in the [crates](#Crate-organization) previously described:
+
+There currently are three `FederationModule`s used in `FedimintConsensus` that exist in the [crates](#Crate-organization) previously described:
 * [Wallet module](wallet_module.md) - handles bitcoin on-chain `PegInProof` inputs and `PegOut` outputs
 * `Mint` module - verifies `Note` input signatures and issues `BlindNote` outputs of different denominations
 * `LightningModule` - creates `ContractInput` inputs and `ContractOrOfferOutput` outputs representing a payment sent or received by a gateway on behalf of a user
@@ -65,7 +66,7 @@ Requests are delegated to an underlying `LnClient`, `MintClient`, or `WalletClie
 A submitted `Transaction` often requires multiple epochs to become spendable, usually because they require signatures from a quorum of federation members.
 Clients query for the `TransactionStatus` by unique `OutPoint` that includes the `TransactionId`.
 
-After enough epochs have passed, the `TransactionStatus` contain either return an `Error` message or the `OutputOutcome` indicating how the inputs were spent and possibly returning data to the user such as blind-signed notes.
+After enough epochs have passed, the `TransactionStatus` resolves either to an `Error` message or the `OutputOutcome` indicating how the inputs were spent and possibly returning data to the user such as blind-signed notes.
 
 ## LN Gateway
 The `LnGateway` communicates with a local Lightning node in order to provide an API that can pay invoices.
