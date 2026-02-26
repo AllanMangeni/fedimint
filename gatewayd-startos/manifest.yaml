@@ -12,7 +12,8 @@ build: ["make"]
 description:
   short: Fedimint Lightning Gateway
   long: |
-    The Fedimint Gateway enables Lightning Network payments for Fedimint federations using an integrated LDK node.
+    The Fedimint Gateway enables Lightning Network payments for Fedimint federations.
+    It can run with an integrated LDK node or connect to an external LND node.
 assets:
   license: LICENSE
   icon: icon.png
@@ -25,6 +26,7 @@ main:
   mounts:
     main: /start-os
     gatewayd: /gatewayd
+    lnd: /mnt/lnd
 hardware-requirements:
   arch:
     - x86_64
@@ -51,6 +53,12 @@ volumes:
     type: data
   gatewayd:
     type: data
+  lnd:
+    type: pointer
+    package-id: lnd
+    volume-id: main
+    path: /public
+    readonly: true
 interfaces:
   main:
     name: Gateway Interface
@@ -73,6 +81,12 @@ dependencies:
       type: "opt-in"
       how: "Install Bitcoin Core from the Start9 marketplace and select it in Gateway config"
     description: "Provides private, self-hosted blockchain data instead of relying on external Esplora APIs"
+  lnd:
+    version: ">=0.16.0 <0.21.0"
+    requirement:
+      type: "opt-in"
+      how: "Install LND from the Start9 marketplace and select LND as your Lightning backend"
+    description: "Use your existing LND node instead of the integrated LDK node"
 backup:
   create:
     type: docker
