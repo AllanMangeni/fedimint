@@ -108,8 +108,11 @@ if [ -z "$PLAINTEXT_PASSWORD" ]; then
 fi
 
 echo "Hashing gateway password..."
-BCRYPT_HASH=$(gateway-cli create-password-hash "$PLAINTEXT_PASSWORD")
-export FM_GATEWAY_BCRYPT_PASSWORD_HASH="$BCRYPT_HASH"
+# gateway-cli outputs the hash wrapped in quotes, so we need to strip them
+# Also strip any trailing newline/whitespace
+BCRYPT_HASH_RAW=$(gateway-cli create-password-hash "$PLAINTEXT_PASSWORD")
+FM_GATEWAY_BCRYPT_PASSWORD_HASH=$(echo "$BCRYPT_HASH_RAW" | tr -d '"' | tr -d '\n')
+export FM_GATEWAY_BCRYPT_PASSWORD_HASH
 
 # Read and set RUST_LOG from config
 RUST_LOG_LEVEL=$(yq '.advanced.rust-log-level' /start-os/start9/config.yaml)
