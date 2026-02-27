@@ -92,28 +92,16 @@ backup:
     type: docker
     image: compat
     system: true
-    entrypoint: compat
-    args:
-      - duplicity
-      - create
-      - /mnt/backup
-      - /gatewayd
-    mounts:
-      BACKUP: "/mnt/backup"
-      gatewayd: "/gatewayd"
+    entrypoint: /bin/true
+    args: []
+    mounts: {}
   restore:
     type: docker
     image: compat
     system: true
-    entrypoint: compat
-    args:
-      - duplicity
-      - restore
-      - /mnt/backup
-      - /gatewayd
-    mounts:
-      BACKUP: "/mnt/backup"
-      gatewayd: "/gatewayd"
+    entrypoint: /bin/true
+    args: []
+    mounts: {}
 migrations:
   from:
     "*":
